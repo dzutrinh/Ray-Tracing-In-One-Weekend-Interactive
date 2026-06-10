@@ -16,3 +16,7 @@ By porting the core C++ math into JavaScript and leveraging Web Workers for para
 ![Alt text](chapter-1.jpg)
 ![Alt text](chapter-2.jpg)
 ![Alt text](chapter-3.jpg)
+
+## Reference
+
+[_Ray Tracing in One Weekend_](https://raytracing.github.io/books/RayTracingInOneWeekend.html)
