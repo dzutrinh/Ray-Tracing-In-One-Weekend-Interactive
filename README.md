@@ -14,6 +14,8 @@ By porting the core C++ math into JavaScript and leveraging Web Workers for para
 
 ## Screenshots
 
+Performance tested on pure M4 Pro CPU
+
 ![Alt text](chapter-1.jpg)
 ![Alt text](chapter-2.jpg)
 ![Alt text](chapter-3.jpg)
