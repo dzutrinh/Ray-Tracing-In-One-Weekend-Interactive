@@ -1,5 +1,6 @@
 # Ray Tracing In One Weekend (Interactive)
 HTML5 based version
+
 Original Repo: https://raytracing.github.io/
 
 The interactive browser-based demos I built serve as a bridge between the raw C++ code of the book and visual intuition. While the book is brilliant, traditional ray tracing is famously slow; changing a single variable like "camera field of view" or "metal fuzziness" typically requires recompiling the code and waiting minutes or hours for a new image to render.
