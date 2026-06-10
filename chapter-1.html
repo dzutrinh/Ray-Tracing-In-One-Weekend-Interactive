@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Ray Tracing in One Weekend</title>
+    <style>
+        body { background-color: #1a1a1a; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin-top: 1rem; }
+        canvas { background-color: black; box-shadow: 0 4px 8px rgba(0,0,0,0.5); border-radius: 4px; margin-bottom: 1rem; }
+        .controls { display: flex; gap: 1.5rem; flex-wrap: wrap; justify-content: center; background: #2a2a2a; padding: 1rem; border-radius: 8px; max-width: 800px; }
+        .control-group { display: flex; flex-direction: column; align-items: center; gap: 0.5rem; font-size: 0.9em; }
+        input[type="range"] { cursor: pointer; width: 120px; }
+        #status { font-family: monospace; color: #4CAF50; font-weight: bold; margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+
+    <h2>Ray Tracing in One Weekend</h2>
+    <div id="status">Ready</div>
+    <canvas id="renderCanvas" width="600" height="337"></canvas> <div class="controls">
+        <div class="control-group">
+            <label>Field of View: <span id="fovVal">20</span>°</label>
+            <input type="range" id="fovSlider" min="10" max="90" value="20">
+        </div>
+        <div class="control-group">
+            <label>Focus Distance: <span id="focusVal">10.0</span></label>
+            <input type="range" id="focusSlider" min="2" max="20" step="0.1" value="10.0">
+        </div>
+        <div class="control-group">
+            <label>Lens Blur (Aperture): <span id="blurVal">0.6</span></label>
+            <input type="range" id="blurSlider" min="0" max="2" step="0.1" value="0.6">
+        </div>
+        <div class="control-group">
+            <label>Samples/Pixel: <span id="samplesVal">10</span></label>
+            <input type="range" id="samplesSlider" min="1" max="100" value="10">
+        </div>
+    </div>
+
+<script>
+const workerScript = `
+    class Vec3 {
+        constructor(x, y, z) { this.x = x; this.y = y; this.z = z; }
+        add(v) { return new Vec3(this.x + v.x, this.y + v.y, this.z + v.z); }
+        sub(v) { return new Vec3(this.x - v.x, this.y - v.y, this.z - v.z); }
+        mul(t) { return new Vec3(this.x * t, this.y * t, this.z * t); }
+        mulV(v) { return new Vec3(this.x * v.x, this.y * v.y, this.z * v.z); }
+        div(t) { return this.mul(1/t); }
+        lengthSq() { return this.x*this.x + this.y*this.y + this.z*this.z; }
+        length() { return Math.sqrt(this.lengthSq()); }
+        normalize() { return this.div(this.length()); }
+        static dot(u, v) { return u.x*v.x + u.y*v.y + u.z*v.z; }
+        static cross(u, v) { return new Vec3(u.y*v.z - u.z*v.y, u.z*v.x - u.x*v.z, u.x*v.y - u.y*v.x); }
+        static random(min=0, max=1) { return new Vec3(min + Math.random()*(max-min), min + Math.random()*(max-min), min + Math.random()*(max-min)); }
+        static randomInUnitSphere() {
+            while (true) {
+                let p = Vec3.random(-1, 1);
+                if (p.lengthSq() < 1) return p;
+            }
+        }
+        static randomUnitVector() { return Vec3.randomInUnitSphere().normalize(); }
+        // NEW: Used for the physical camera lens blur
+        static randomInUnitDisk() {
+            while (true) {
+                let p = new Vec3(-1 + Math.random()*2, -1 + Math.random()*2, 0);
+                if (p.lengthSq() < 1) return p;
+            }
+        }
+        static reflect(v, n) { return v.sub(n.mul(2 * Vec3.dot(v, n))); }
+        static refract(uv, n, etai_over_etat) {
+            let cos_theta = Math.min(Vec3.dot(uv.mul(-1), n), 1.0);
+            let r_out_perp = uv.add(n.mul(cos_theta)).mul(etai_over_etat);
+            let r_out_parallel = n.mul(-Math.sqrt(Math.abs(1.0 - r_out_perp.lengthSq())));
+            return r_out_perp.add(r_out_parallel);
+        }
+    }
+
+    class Ray {
+        constructor(origin, direction) { this.origin = origin; this.direction = direction; }
+        at(t) { return this.origin.add(this.direction.mul(t)); }
+    }
+
+    class Lambertian {
+        constructor(albedo) { this.albedo = albedo; }
+        scatter(ray, rec) {
+            let scatter_direction = rec.normal.add(Vec3.randomUnitVector());
+            if (scatter_direction.lengthSq() < 1e-8) scatter_direction = rec.normal;
+            return { ray: new Ray(rec.p, scatter_direction), attenuation: this.albedo };
+        }
+    }
+
+    class Metal {
+        constructor(albedo, fuzz) { this.albedo = albedo; this.fuzz = fuzz < 1 ? fuzz : 1; }
+        scatter(ray, rec) {
+            let reflected = Vec3.reflect(ray.direction.normalize(), rec.normal);
+            let scattered = new Ray(rec.p, reflected.add(Vec3.randomInUnitSphere().mul(this.fuzz)));
+            if (Vec3.dot(scattered.direction, rec.normal) > 0) return { ray: scattered, attenuation: this.albedo };
+            return null;
+        }
+    }
+
+    class Dielectric {
+        constructor(ir) { this.ir = ir; }
+        scatter(ray, rec) {
+            let refraction_ratio = rec.front_face ? (1.0 / this.ir) : this.ir;
+            let unit_direction = ray.direction.normalize();
+            let cos_theta = Math.min(Vec3.dot(unit_direction.mul(-1), rec.normal), 1.0);
+            let sin_theta = Math.sqrt(1.0 - cos_theta*cos_theta);
+            
+            let cannot_refract = refraction_ratio * sin_theta > 1.0;
+            let direction;
+            if (cannot_refract || this.reflectance(cos_theta, refraction_ratio) > Math.random()) {
+                direction = Vec3.reflect(unit_direction, rec.normal);
+            } else {
+                direction = Vec3.refract(unit_direction, rec.normal, refraction_ratio);
+            }
+            return { ray: new Ray(rec.p, direction), attenuation: new Vec3(1.0, 1.0, 1.0) };
+        }
+        reflectance(cosine, ref_idx) {
+            let r0 = (1 - ref_idx) / (1 + ref_idx);
+            r0 = r0 * r0;
+            return r0 + (1 - r0) * Math.pow((1 - cosine), 5);
+        }
+    }
+
+    class Sphere {
+        constructor(center, radius, material) { this.center = center; this.radius = radius; this.material = material; }
+        hit(ray, t_min, t_max) {
+            let oc = ray.origin.sub(this.center);
+            let a = ray.direction.lengthSq();
+            let half_b = Vec3.dot(oc, ray.direction);
+            let c = oc.lengthSq() - this.radius * this.radius;
+            let discriminant = half_b * half_b - a * c;
+            
+            if (discriminant < 0) return null;
+            let sqrtd = Math.sqrt(discriminant);
+            let root = (-half_b - sqrtd) / a;
+            
+            if (root <= t_min || t_max <= root) {
+                root = (-half_b + sqrtd) / a;
+                if (root <= t_min || t_max <= root) return null;
+            }
+            
+            let p = ray.at(root);
+            let outward_normal = p.sub(this.center).div(this.radius);
+            let front_face = Vec3.dot(ray.direction, outward_normal) < 0;
+            let normal = front_face ? outward_normal : outward_normal.mul(-1);
+            
+            return { t: root, p: p, normal: normal, front_face: front_face, material: this.material };
+        }
+    }
+
+    class HittableList {
+        constructor() { this.objects = []; }
+        add(obj) { this.objects.push(obj); }
+        hit(ray, t_min, t_max) {
+            let temp_rec = null;
+            let closest_so_far = t_max;
+            for (let obj of this.objects) {
+                let rec = obj.hit(ray, t_min, closest_so_far);
+                if (rec) {
+                    closest_so_far = rec.t;
+                    temp_rec = rec;
+                }
+            }
+            return temp_rec;
+        }
+    }
+
+    function rayColor(ray, world, depth) {
+        if (depth <= 0) return new Vec3(0, 0, 0);
+        let rec = world.hit(ray, 0.001, Infinity);
+        if (rec) {
+            let scatterResult = rec.material.scatter(ray, rec);
+            if (scatterResult) {
+                let colorFromBounce = rayColor(scatterResult.ray, world, depth - 1);
+                return scatterResult.attenuation.mulV(colorFromBounce);
+            }
+            return new Vec3(0, 0, 0);
+        }
+        let unit_direction = ray.direction.normalize();
+        let t = 0.5 * (unit_direction.y + 1.0);
+        return new Vec3(1.0, 1.0, 1.0).mul(1.0 - t).add(new Vec3(0.5, 0.7, 1.0).mul(t));
+    }
+
+    function buildScene() {
+        let world = new HittableList();
+        world.add(new Sphere(new Vec3(0, -1000, 0), 1000, new Lambertian(new Vec3(0.5, 0.5, 0.5))));
+
+        let seed = 1234567;
+        function seededRandom() { seed = (seed * 9301 + 49297) % 233280; return seed / 233280; }
+
+        for (let a = -11; a < 11; a++) {
+            for (let b = -11; b < 11; b++) {
+                let choose_mat = seededRandom();
+                let center = new Vec3(a + 0.9 * seededRandom(), 0.2, b + 0.9 * seededRandom());
+                if (center.sub(new Vec3(4, 0.2, 0)).length() > 0.9) {
+                    let sphere_material;
+                    if (choose_mat < 0.8) {
+                        let albedo = new Vec3(seededRandom(), seededRandom(), seededRandom()).mulV(new Vec3(seededRandom(), seededRandom(), seededRandom()));
+                        sphere_material = new Lambertian(albedo);
+                    } else if (choose_mat < 0.95) {
+                        let albedo = new Vec3(0.5 + 0.5*seededRandom(), 0.5 + 0.5*seededRandom(), 0.5 + 0.5*seededRandom());
+                        let fuzz = seededRandom() * 0.5;
+                        sphere_material = new Metal(albedo, fuzz);
+                    } else {
+                        sphere_material = new Dielectric(1.5);
+                    }
+                    world.add(new Sphere(center, 0.2, sphere_material));
+                }
+            }
+        }
+
+        world.add(new Sphere(new Vec3(0, 1, 0), 1.0, new Dielectric(1.5)));
+        world.add(new Sphere(new Vec3(-4, 1, 0), 1.0, new Lambertian(new Vec3(0.4, 0.2, 0.1))));
+        world.add(new Sphere(new Vec3(4, 1, 0), 1.0, new Metal(new Vec3(0.7, 0.6, 0.5), 0.0)));
+        return world;
+    }
+
+    const world = buildScene();
+
+    self.onmessage = function(e) {
+        const { startY, endY, width, height, samples, maxDepth, camParams } = e.data;
+        const buffer = new Uint8ClampedArray((endY - startY) * width * 4);
+        
+        // --- FULL POSITIONABLE CAMERA MATH ---
+        let theta = camParams.vfov * Math.PI / 180.0;
+        let h = Math.tan(theta/2);
+        let viewport_height = 2.0 * h * camParams.focus_dist;
+        let viewport_width = viewport_height * (width / height);
+
+        let lookfrom = new Vec3(camParams.lookfrom.x, camParams.lookfrom.y, camParams.lookfrom.z);
+        let lookat = new Vec3(camParams.lookat.x, camParams.lookat.y, camParams.lookat.z);
+        let vup = new Vec3(camParams.vup.x, camParams.vup.y, camParams.vup.z);
+
+        let w = lookfrom.sub(lookat).normalize();
+        let u = Vec3.cross(vup, w).normalize();
+        let v = Vec3.cross(w, u);
+
+        let origin = lookfrom;
+        let horizontal = u.mul(viewport_width);
+        let vertical = v.mul(viewport_height);
+        let lower_left_corner = origin.sub(horizontal.div(2)).sub(vertical.div(2)).sub(w.mul(camParams.focus_dist));
+
+        let defocus_radius = camParams.focus_dist * Math.tan((camParams.defocus_angle / 2) * Math.PI / 180.0);
+        let defocus_disk_u = u.mul(defocus_radius);
+        let defocus_disk_v = v.mul(defocus_radius);
+        // -------------------------------------
+
+        for (let j = endY - 1; j >= startY; --j) {
+            for (let i = 0; i < width; ++i) {
+                let pixel_color = new Vec3(0, 0, 0);
+                for (let s = 0; s < samples; ++s) {
+                    let s_u = (i + Math.random()) / (width - 1);
+                    let s_v = (j + Math.random()) / (height - 1);
+                    
+                    // Defocus Blur calculations
+                    let rd = Vec3.randomInUnitDisk().mul(defocus_radius);
+                    let offset = defocus_disk_u.mul(rd.x).add(defocus_disk_v.mul(rd.y));
+                    let ray_origin = (camParams.defocus_angle <= 0) ? origin : origin.add(offset);
+                    
+                    let dir = lower_left_corner.add(horizontal.mul(s_u)).add(vertical.mul(s_v)).sub(ray_origin);
+                    let r = new Ray(ray_origin, dir);
+                    pixel_color = pixel_color.add(rayColor(r, world, maxDepth));
+                }
+                
+                let scale = 1.0 / samples;
+                let c_r = Math.sqrt(pixel_color.x * scale);
+                let c_g = Math.sqrt(pixel_color.y * scale);
+                let c_b = Math.sqrt(pixel_color.z * scale);
+                
+                let canvasY = (endY - 1 - j);
+                let ptr = (canvasY * width + i) * 4;
+                buffer[ptr]   = 256 * Math.max(0.0, Math.min(0.999, c_r));
+                buffer[ptr+1] = 256 * Math.max(0.0, Math.min(0.999, c_g));
+                buffer[ptr+2] = 256 * Math.max(0.0, Math.min(0.999, c_b));
+                buffer[ptr+3] = 255;
+            }
+        }
+        self.postMessage({ startY, endY, buffer }, [buffer.buffer]);
+    };
+`;
+
+const canvas = document.getElementById('renderCanvas');
+const ctx = canvas.getContext('2d');
+const statusText = document.getElementById('status');
+const blob = new Blob([workerScript], { type: 'application/javascript' });
+const workerUrl = URL.createObjectURL(blob);
+
+const fovSlider = document.getElementById('fovSlider');
+const focusSlider = document.getElementById('focusSlider');
+const blurSlider = document.getElementById('blurSlider');
+const samplesSlider = document.getElementById('samplesSlider');
+
+let workers = [];
+let activeWorkers = 0;
+
+function startRender() {
+    workers.forEach(w => w.terminate());
+    workers = [];
+    activeWorkers = 0;
+
+    // Hardcoded Book Variables
+    const lookfrom = {x: 13, y: 2, z: 3};
+    const lookat = {x: 0, y: 0, z: 0};
+    const vup = {x: 0, y: 1, z: 0};
+    const maxDepth = 10; // Keep at 10 for browser sanity, book uses 50
+
+    // Dynamic Variables
+    const camParams = {
+        lookfrom, lookat, vup,
+        vfov: parseFloat(fovSlider.value),
+        focus_dist: parseFloat(focusSlider.value),
+        defocus_angle: parseFloat(blurSlider.value)
+    };
+    
+    const samples = parseInt(samplesSlider.value);
+    const width = canvas.width;
+    const height = canvas.height;
+    
+    const numCores = navigator.hardwareConcurrency || 4; 
+    statusText.innerText = `Rendering with ${numCores} threads...`;
+    let startTime = performance.now();
+    const chunkHeight = Math.ceil(height / numCores);
+
+    for (let i = 0; i < numCores; i++) {
+        const worker = new Worker(workerUrl);
+        workers.push(worker);
+        const startY = i * chunkHeight;
+        const endY = Math.min(startY + chunkHeight, height);
+        if (startY >= height) break;
+
+        activeWorkers++;
+        worker.onmessage = (e) => {
+            const { startY: retStartY, endY: retEndY, buffer } = e.data;
+            const imageData = new ImageData(new Uint8ClampedArray(buffer), width, retEndY - retStartY);
+            ctx.putImageData(imageData, 0, height - retEndY);
+            
+            activeWorkers--;
+            if (activeWorkers === 0) {
+                statusText.innerText = `Finished in ${((performance.now() - startTime) / 1000).toFixed(2)}s`;
+            }
+        };
+
+        worker.postMessage({ startY, endY, width, height, samples, maxDepth, camParams });
+    }
+}
+
+[fovSlider, focusSlider, blurSlider, samplesSlider].forEach(slider => {
+    slider.addEventListener('input', (e) => {
+        document.getElementById(e.target.id.replace('Slider', 'Val')).innerText = e.target.value;
+        startRender();
+    });
+});
+
+startRender();
+</script>
+</body>
+</html>

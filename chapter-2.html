@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Ray Tracing - The Next Week</title>
+    <style>
+        body { background-color: #1a1a1a; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin-top: 1rem; }
+        canvas { background-color: black; box-shadow: 0 4px 15px rgba(0,0,0,0.8); border-radius: 4px; margin-bottom: 1rem; }
+        .dashboard { display: flex; gap: 2rem; flex-wrap: wrap; justify-content: center; max-width: 900px; }
+        .control-panel { background: #2a2a2a; padding: 1.5rem; border-radius: 8px; display: flex; flex-direction: column; gap: 1rem; flex: 1; min-width: 250px; }
+        .panel-title { font-weight: bold; margin-bottom: 0.5rem; color: #4CAF50; border-bottom: 1px solid #444; padding-bottom: 0.5rem; text-align: center; }
+        .control-group { display: flex; justify-content: space-between; align-items: center; font-size: 0.9em; }
+        input[type="range"] { cursor: pointer; width: 120px; }
+        #status { font-family: monospace; color: #ffeb3b; font-weight: bold; margin-bottom: 1rem; font-size: 1.1em; }
+    </style>
+</head>
+<body>
+
+    <h2>Ray Tracing - The Next Week</h2>
+    <div id="status">Ready</div>
+    <canvas id="renderCanvas" width="500" height="500"></canvas> 
+    
+    <div class="dashboard">
+        <div class="control-panel">
+            <div class="panel-title">Renderer Limits</div>
+            <div class="control-group">
+                <label>Samples/Pixel:</label>
+                <div><span id="samplesVal">20</span> <input type="range" id="samplesSlider" min="5" max="100" step="5" value="20"></div>
+            </div>
+            <div class="control-group">
+                <label>Max Bounces:</label>
+                <div><span id="depthVal">8</span> <input type="range" id="depthSlider" min="2" max="25" step="1" value="8"></div>
+            </div>
+        </div>
+
+        <div class="control-panel">
+            <div class="panel-title">Volumetric Controls</div>
+            <div class="control-group">
+                <label>Global Fog Density:</label>
+                <div><span id="globalFogVal">0.0001</span> <input type="range" id="globalFogSlider" min="0.0000" max="0.0010" step="0.0001" value="0.0001"></div>
+            </div>
+            <div class="control-group">
+                <label>Blue Sphere Fog:</label>
+                <div><span id="fogVal">0.20</span> <input type="range" id="fogSlider" min="0.01" max="1.0" step="0.05" value="0.20"></div>
+            </div>
+        </div>
+    </div>
+
+<script>
+const workerScript = `
+    class Vec3 {
+        constructor(x, y, z) { this.x = x; this.y = y; this.z = z; }
+        add(v) { return new Vec3(this.x + v.x, this.y + v.y, this.z + v.z); }
+        sub(v) { return new Vec3(this.x - v.x, this.y - v.y, this.z - v.z); }
+        mul(t) { return new Vec3(this.x * t, this.y * t, this.z * t); }
+        mulV(v) { return new Vec3(this.x * v.x, this.y * v.y, this.z * v.z); }
+        div(t) { return this.mul(1/t); }
+        lengthSq() { return this.x*this.x + this.y*this.y + this.z*this.z; }
+        length() { return Math.sqrt(this.lengthSq()); }
+        normalize() { return this.div(this.length()); }
+        static dot(u, v) { return u.x*v.x + u.y*v.y + u.z*v.z; }
+        static cross(u, v) { return new Vec3(u.y*v.z - u.z*v.y, u.z*v.x - u.x*v.z, u.x*v.y - u.y*v.x); }
+        static random(min=0, max=1) { return new Vec3(min + Math.random()*(max-min), min + Math.random()*(max-min), min + Math.random()*(max-min)); }
+        static randomInUnitSphere() {
+            while (true) { let p = Vec3.random(-1, 1); if (p.lengthSq() < 1) return p; }
+        }
+        static randomUnitVector() { return Vec3.randomInUnitSphere().normalize(); }
+        static reflect(v, n) { return v.sub(n.mul(2 * Vec3.dot(v, n))); }
+        static refract(uv, n, etai_over_etat) {
+            let cos_theta = Math.min(Vec3.dot(uv.mul(-1), n), 1.0);
+            let r_out_perp = uv.add(n.mul(cos_theta)).mul(etai_over_etat);
+            let r_out_parallel = n.mul(-Math.sqrt(Math.abs(1.0 - r_out_perp.lengthSq())));
+            return r_out_perp.add(r_out_parallel);
+        }
+    }
+
+    class Ray {
+        constructor(origin, direction, time = 0.0) { this.origin = origin; this.direction = direction; this.time = time; }
+        at(t) { return this.origin.add(this.direction.mul(t)); }
+    }
+
+    // --- TEXTURES ---
+    class SolidColor {
+        constructor(color) { this.color = color; }
+        value(u, v, p) { return this.color; }
+    }
+    class NoiseTexture {
+        constructor(scale) { this.scale = scale; }
+        value(u, v, p) {
+            let s = this.scale;
+            let n = Math.sin(s * p.z + 5 * Math.sin(s * p.x) + 5 * Math.sin(s * p.y));
+            return new Vec3(1,1,1).mul(0.5 * (1 + n));
+        }
+    }
+
+    // --- MATERIALS ---
+    class Material {
+        emitted(front_face) { return new Vec3(0, 0, 0); }
+        scatter(ray, rec) { return null; }
+    }
+    class Lambertian extends Material {
+        constructor(texture) { super(); this.albedo = texture; }
+        scatter(ray, rec) {
+            let scatter_dir = rec.normal.add(Vec3.randomUnitVector());
+            if (scatter_dir.lengthSq() < 1e-8) scatter_dir = rec.normal;
+            return { ray: new Ray(rec.p, scatter_dir, ray.time), attenuation: this.albedo.value(rec.u, rec.v, rec.p) };
+        }
+    }
+    class Metal extends Material {
+        constructor(albedo, fuzz) { super(); this.albedo = albedo; this.fuzz = fuzz; }
+        scatter(ray, rec) {
+            let reflected = Vec3.reflect(ray.direction.normalize(), rec.normal);
+            let scattered = new Ray(rec.p, reflected.add(Vec3.randomInUnitSphere().mul(this.fuzz)), ray.time);
+            if (Vec3.dot(scattered.direction, rec.normal) > 0) return { ray: scattered, attenuation: this.albedo };
+            return null;
+        }
+    }
+    class Dielectric extends Material {
+        constructor(ir) { super(); this.ir = ir; }
+        scatter(ray, rec) {
+            let refraction_ratio = rec.front_face ? (1.0 / this.ir) : this.ir;
+            let unit_direction = ray.direction.normalize();
+            let cos_theta = Math.min(Vec3.dot(unit_direction.mul(-1), rec.normal), 1.0);
+            let sin_theta = Math.sqrt(1.0 - cos_theta*cos_theta);
+            let direction = (refraction_ratio * sin_theta > 1.0 || this.reflectance(cos_theta, refraction_ratio) > Math.random()) 
+                ? Vec3.reflect(unit_direction, rec.normal) 
+                : Vec3.refract(unit_direction, rec.normal, refraction_ratio);
+            return { ray: new Ray(rec.p, direction, ray.time), attenuation: new Vec3(1.0, 1.0, 1.0) };
+        }
+        reflectance(cosine, ref_idx) {
+            let r0 = (1 - ref_idx) / (1 + ref_idx); r0 = r0 * r0;
+            return r0 + (1 - r0) * Math.pow((1 - cosine), 5);
+        }
+    }
+    class DiffuseLight extends Material {
+        constructor(color) { super(); this.color = color; }
+        scatter(ray, rec) { return null; }
+        emitted(front_face) { return front_face ? this.color : new Vec3(0,0,0); }
+    }
+    class Isotropic extends Material {
+        constructor(color) { super(); this.albedo = color; }
+        scatter(ray, rec) {
+            return { ray: new Ray(rec.p, Vec3.randomUnitVector(), ray.time), attenuation: this.albedo };
+        }
+    }
+
+    // --- GEOMETRY & VOLUMES ---
+    class Sphere {
+        constructor(center, radius, material) { this.center = center; this.radius = radius; this.material = material; }
+        hit(ray, t_min, t_max) {
+            let oc = ray.origin.sub(this.center);
+            let a = ray.direction.lengthSq();
+            let half_b = Vec3.dot(oc, ray.direction);
+            let c = oc.lengthSq() - this.radius * this.radius;
+            let discriminant = half_b * half_b - a * c;
+            if (discriminant < 0) return null;
+            let sqrtd = Math.sqrt(discriminant);
+            let root = (-half_b - sqrtd) / a;
+            if (root <= t_min || t_max <= root) {
+                root = (-half_b + sqrtd) / a;
+                if (root <= t_min || t_max <= root) return null;
+            }
+            let p = ray.at(root);
+            let outward_normal = p.sub(this.center).div(this.radius);
+            let front_face = Vec3.dot(ray.direction, outward_normal) < 0;
+            return { t: root, p: p, normal: front_face ? outward_normal : outward_normal.mul(-1), front_face: front_face, material: this.material };
+        }
+    }
+
+    class Quad {
+        constructor(Q, u, v, material) {
+            this.Q = Q; this.u = u; this.v = v; this.material = material;
+            let n = Vec3.cross(u, v);
+            this.normal = n.normalize();
+            this.D = Vec3.dot(this.normal, Q);
+            this.w = n.div(Vec3.dot(n, n));
+        }
+        hit(ray, t_min, t_max) {
+            let denom = Vec3.dot(this.normal, ray.direction);
+            if (Math.abs(denom) < 1e-8) return null;
+            let t = (this.D - Vec3.dot(this.normal, ray.origin)) / denom;
+            if (t < t_min || t > t_max) return null;
+            let intersection = ray.at(t);
+            let planar_hitpt_vector = intersection.sub(this.Q);
+            let alpha = Vec3.dot(this.w, Vec3.cross(planar_hitpt_vector, this.v));
+            let beta = Vec3.dot(this.w, Vec3.cross(this.u, planar_hitpt_vector));
+            if (alpha < 0 || alpha > 1 || beta < 0 || beta > 1) return null;
+            let front_face = Vec3.dot(ray.direction, this.normal) < 0;
+            return { t: t, p: intersection, normal: front_face ? this.normal : this.normal.mul(-1), front_face: front_face, material: this.material };
+        }
+    }
+
+    class ConstantMedium {
+        constructor(boundary, density, color) {
+            this.boundary = boundary;
+            this.neg_inv_density = -1.0 / density;
+            this.phase_function = new Isotropic(color);
+        }
+        hit(ray, t_min, t_max) {
+            let rec1 = this.boundary.hit(ray, -Infinity, Infinity);
+            if (!rec1) return null;
+            let rec2 = this.boundary.hit(ray, rec1.t + 0.0001, Infinity);
+            if (!rec2) return null;
+
+            let t1 = Math.max(rec1.t, t_min);
+            let t2 = Math.min(rec2.t, t_max);
+            if (t1 >= t2) return null;
+            t1 = Math.max(t1, 0);
+
+            let ray_length = ray.direction.length();
+            let distance_inside_boundary = (t2 - t1) * ray_length;
+            let hit_distance = this.neg_inv_density * Math.log(Math.random());
+
+            if (hit_distance > distance_inside_boundary) return null;
+
+            let t = t1 + hit_distance / ray_length;
+            return { t: t, p: ray.at(t), normal: new Vec3(1,0,0), front_face: true, material: this.phase_function };
+        }
+    }
+
+    class Translate {
+        constructor(obj, offset) { this.obj = obj; this.offset = offset; }
+        hit(ray, t_min, t_max) {
+            let offset_ray = new Ray(ray.origin.sub(this.offset), ray.direction, ray.time);
+            let rec = this.obj.hit(offset_ray, t_min, t_max);
+            if (!rec) return null;
+            rec.p = rec.p.add(this.offset);
+            return rec;
+        }
+    }
+
+    class HittableList {
+        constructor() { this.objects = []; }
+        add(obj) { this.objects.push(obj); }
+        hit(ray, t_min, t_max) {
+            let temp_rec = null, closest_so_far = t_max;
+            for (let obj of this.objects) {
+                let rec = obj.hit(ray, t_min, closest_so_far);
+                if (rec) { closest_so_far = rec.t; temp_rec = rec; }
+            }
+            return temp_rec;
+        }
+    }
+
+    function box(p0, p1, mat) {
+        let list = new HittableList();
+        list.add(new Quad(new Vec3(p0.x, p0.y, p1.z), new Vec3(p1.x-p0.x, 0, 0), new Vec3(0, p1.y-p0.y, 0), mat));
+        list.add(new Quad(new Vec3(p1.x, p0.y, p0.z), new Vec3(p0.x-p1.x, 0, 0), new Vec3(0, p1.y-p0.y, 0), mat));
+        list.add(new Quad(new Vec3(p0.x, p1.y, p1.z), new Vec3(p1.x-p0.x, 0, 0), new Vec3(0, 0, p0.z-p1.z), mat));
+        list.add(new Quad(new Vec3(p0.x, p0.y, p0.z), new Vec3(p1.x-p0.x, 0, 0), new Vec3(0, 0, p1.z-p0.z), mat));
+        list.add(new Quad(new Vec3(p1.x, p0.y, p1.z), new Vec3(0, 0, p0.z-p1.z), new Vec3(0, p1.y-p0.y, 0), mat));
+        list.add(new Quad(new Vec3(p0.x, p0.y, p0.z), new Vec3(0, 0, p1.z-p0.z), new Vec3(0, p1.y-p0.y, 0), mat));
+        return list;
+    }
+
+    function rayColor(ray, world, depth) {
+        if (depth <= 0) return new Vec3(0, 0, 0);
+        let rec = world.hit(ray, 0.001, Infinity);
+        if (!rec) return new Vec3(0, 0, 0); 
+        
+        let emitted = rec.material.emitted(rec.front_face);
+        let scatterResult = rec.material.scatter(ray, rec);
+        
+        if (scatterResult) {
+            let colorFromBounce = rayColor(scatterResult.ray, world, depth - 1);
+            return emitted.add(scatterResult.attenuation.mulV(colorFromBounce));
+        }
+        return emitted;
+    }
+
+    function buildScene(cfg) {
+        let world = new HittableList();
+        
+        // --- THE FIX: Seeded Random Generator ---
+        let seed = 9876543;
+        function seededRandom() {
+            seed = (seed * 9301 + 49297) % 233280;
+            return seed / 233280;
+        }
+
+        // 1. GROUND BOXES (DETERMINISTIC)
+        let boxes1 = new HittableList();
+        let groundMat = new Lambertian(new SolidColor(new Vec3(0.48, 0.83, 0.53)));
+        let boxes_per_side = 8; 
+        for(let i=0; i<boxes_per_side; i++) {
+            for(let j=0; j<boxes_per_side; j++) {
+                let w = 250.0; 
+                let x0 = -1000.0 + i*w; let z0 = -1000.0 + j*w; let y0 = 0.0;
+                let x1 = x0 + w; 
+                let y1 = 1 + 100 * seededRandom(); // Fixed here
+                let z1 = z0 + w;
+                boxes1.add(box(new Vec3(x0,y0,z0), new Vec3(x1,y1,z1), groundMat));
+            }
+        }
+        world.add(boxes1);
+
+        // 2. LIGHT Panel
+        let light = new DiffuseLight(new Vec3(7, 7, 7));
+        world.add(new Quad(new Vec3(123,554,147), new Vec3(300,0,0), new Vec3(0,0,265), light));
+
+        // 3. Central Spheres
+        let center1 = new Vec3(400, 400, 200);
+        world.add(new Sphere(center1, 50, new Lambertian(new SolidColor(new Vec3(0.7, 0.3, 0.1))))); 
+        world.add(new Sphere(new Vec3(260, 150, 45), 50, new Dielectric(1.5))); 
+        world.add(new Sphere(new Vec3(0, 150, 145), 50, new Metal(new Vec3(0.8, 0.8, 0.9), 1.0))); 
+
+        // 4. Blue Fog Volume
+        let boundary = new Sphere(new Vec3(360, 150, 145), 70, new Dielectric(1.5));
+        world.add(boundary);
+        world.add(new ConstantMedium(boundary, cfg.fog, new Vec3(0.2, 0.4, 0.9)));
+        
+        // 5. GLOBAL FOG
+        let universe = new Sphere(new Vec3(0,0,0), 5000, new Dielectric(1.5));
+        world.add(new ConstantMedium(universe, cfg.globalFog, new Vec3(1, 1, 1)));
+
+        // 6. Two Noise Spheres
+        let noiseMat = new Lambertian(new NoiseTexture(0.1));
+        world.add(new Sphere(new Vec3(220, 280, 300), 80, noiseMat));
+        world.add(new Sphere(new Vec3(400, 200, 400), 100, noiseMat)); 
+
+        // 7. Translated Block Cluster (DETERMINISTIC)
+        let boxes2 = new HittableList();
+        let white = new Lambertian(new SolidColor(new Vec3(0.73, 0.73, 0.73)));
+        for(let j=0; j<80; j++) {
+            let rx = 165 * seededRandom(); // Fixed here
+            let ry = 165 * seededRandom(); // Fixed here
+            let rz = 165 * seededRandom(); // Fixed here
+            boxes2.add(new Sphere(new Vec3(rx, ry, rz), 10, white));
+        }
+        world.add(new Translate(boxes2, new Vec3(-100, 270, 395)));
+
+        return world;
+    }
+
+    self.onmessage = function(e) {
+        const { startY, endY, width, height, cfg } = e.data;
+        const buffer = new Uint8ClampedArray((endY - startY) * width * 4);
+        const world = buildScene(cfg);
+
+        let lookfrom = new Vec3(478, 278, -600);
+        let lookat = new Vec3(278, 278, 0);
+        let vup = new Vec3(0, 1, 0);
+        let theta = 40 * Math.PI / 180.0;
+        let h = Math.tan(theta/2);
+        let viewport_height = 2.0 * h;
+        let viewport_width = viewport_height * (width / height);
+
+        let w = lookfrom.sub(lookat).normalize();
+        let u = Vec3.cross(vup, w).normalize();
+        let v = Vec3.cross(w, u);
+
+        let origin = lookfrom;
+        let horizontal = u.mul(viewport_width);
+        let vertical = v.mul(viewport_height);
+        let lower_left_corner = origin.sub(horizontal.div(2)).sub(vertical.div(2)).sub(w);
+
+        for (let j = endY - 1; j >= startY; --j) {
+            for (let i = 0; i < width; ++i) {
+                let pixel_color = new Vec3(0, 0, 0);
+                for (let s = 0; s < cfg.samples; ++s) {
+                    let s_u = (i + Math.random()) / (width - 1);
+                    let s_v = (j + Math.random()) / (height - 1);
+                    let dir = lower_left_corner.add(horizontal.mul(s_u)).add(vertical.mul(s_v)).sub(origin);
+                    let r = new Ray(origin, dir, Math.random());
+                    pixel_color = pixel_color.add(rayColor(r, world, cfg.depth));
+                }
+                
+                let scale = 1.0 / cfg.samples;
+                let c_r = Math.sqrt(pixel_color.x * scale);
+                let c_g = Math.sqrt(pixel_color.y * scale);
+                let c_b = Math.sqrt(pixel_color.z * scale);
+                
+                let canvasY = (endY - 1 - j);
+                let ptr = (canvasY * width + i) * 4;
+                buffer[ptr]   = 256 * Math.max(0.0, Math.min(0.999, c_r));
+                buffer[ptr+1] = 256 * Math.max(0.0, Math.min(0.999, c_g));
+                buffer[ptr+2] = 256 * Math.max(0.0, Math.min(0.999, c_b));
+                buffer[ptr+3] = 255;
+            }
+        }
+        self.postMessage({ startY, endY, buffer }, [buffer.buffer]);
+    };
+`;
+
+const canvas = document.getElementById('renderCanvas');
+const ctx = canvas.getContext('2d');
+const statusText = document.getElementById('status');
+const blob = new Blob([workerScript], { type: 'application/javascript' });
+const workerUrl = URL.createObjectURL(blob);
+
+const elements = {
+    samples: document.getElementById('samplesSlider'),
+    depth: document.getElementById('depthSlider'),
+    globalFog: document.getElementById('globalFogSlider'),
+    fog: document.getElementById('fogSlider')
+};
+
+let workers = [];
+let activeWorkers = 0;
+
+function startRender() {
+    workers.forEach(w => w.terminate());
+    workers = [];
+    activeWorkers = 0;
+
+    const cfg = {
+        samples: parseInt(elements.samples.value),
+        depth: parseInt(elements.depth.value),
+        globalFog: parseFloat(elements.globalFog.value),
+        fog: parseFloat(elements.fog.value)
+    };
+
+    const width = canvas.width;
+    const height = canvas.height;
+    
+    const numCores = navigator.hardwareConcurrency || 4; 
+    statusText.innerText = `Calculating Final Scene... (${numCores} threads)`;
+    let startTime = performance.now();
+    const chunkHeight = Math.ceil(height / numCores);
+
+    for (let i = 0; i < numCores; i++) {
+        const worker = new Worker(workerUrl);
+        workers.push(worker);
+        const startY = i * chunkHeight;
+        const endY = Math.min(startY + chunkHeight, height);
+        if (startY >= height) break;
+
+        activeWorkers++;
+        worker.onmessage = (e) => {
+            const { startY: retStartY, endY: retEndY, buffer } = e.data;
+            const imageData = new ImageData(new Uint8ClampedArray(buffer), width, retEndY - retStartY);
+            ctx.putImageData(imageData, 0, height - retEndY);
+            
+            activeWorkers--;
+            if (activeWorkers === 0) {
+                statusText.innerText = `Render Finished in ${((performance.now() - startTime) / 1000).toFixed(2)}s`;
+            }
+        };
+
+        worker.postMessage({ startY, endY, width, height, cfg });
+    }
+}
+
+Object.keys(elements).forEach(key => {
+    elements[key].addEventListener('change', (e) => {
+        const valSpan = document.getElementById(key + 'Val');
+        if(valSpan) { valSpan.innerText = e.target.value; }
+        startRender();
+    });
+});
+
+startRender();
+</script>
+</body>
+</html>
