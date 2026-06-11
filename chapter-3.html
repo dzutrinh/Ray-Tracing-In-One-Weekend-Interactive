@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Ray Tracing: The Rest of Your Life (Bucket Rendering)</title>
+    <title>Ray Tracing: The Rest of Your Life (Advanced Denoiser)</title>
     <style>
         body { background-color: #1a1a1a; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin-top: 1rem; }
         canvas { background-color: black; box-shadow: 0 4px 15px rgba(0,0,0,0.8); border-radius: 4px; margin-bottom: 1rem; }
@@ -11,7 +11,7 @@
         .panel-title { font-weight: bold; margin-bottom: 0.5rem; color: #4CAF50; border-bottom: 1px solid #444; padding-bottom: 0.5rem; text-align: center; }
         .control-group { display: flex; justify-content: space-between; align-items: center; font-size: 0.9em; }
         input[type="range"] { cursor: pointer; width: 120px; }
-        input[type="color"] { cursor: pointer; height: 25px; border: none; border-radius: 4px; background: none; }
+        input[type="color"], input[type="checkbox"] { cursor: pointer; height: 25px; border: none; border-radius: 4px; background: none; }
         #status { font-family: monospace; color: #ffeb3b; font-weight: bold; margin-bottom: 1rem; font-size: 1.1em; }
     </style>
 </head>
@@ -25,8 +25,12 @@
         <div class="control-panel">
             <div class="panel-title">Render Engine</div>
             <div class="control-group">
+                <label>Enable Two-pass simple Denoiser:</label>
+                <input type="checkbox" id="denoiseToggle">
+            </div>
+            <div class="control-group">
                 <label>Samples/Pixel:</label>
-                <div><span id="samplesVal">20</span> <input type="range" id="samplesSlider" min="1" max="1024" step="1" value="50"></div>
+                <div><span id="samplesVal">50</span> <input type="range" id="samplesSlider" min="1" max="1024" step="1" value="50"></div>
             </div>
             <div class="control-group">
                 <label>Max Bounce Depth:</label>
@@ -239,15 +243,13 @@ const workerScript = `
         let lightColor = new Vec3(lightConfig.r, lightConfig.g, lightConfig.b);
         let lightMat = new DiffuseLight(lightColor.mul(lightConfig.intensity));
 
-        // Walls
         world.add(new Quad(new Vec3(555,0,0), new Vec3(0,555,0), new Vec3(0,0,555), green)); 
         world.add(new Quad(new Vec3(0,0,0), new Vec3(0,555,0), new Vec3(0,0,555), red));     
         world.add(new Quad(new Vec3(0,0,0), new Vec3(555,0,0), new Vec3(0,0,555), white));   
         world.add(new Quad(new Vec3(0,555,0), new Vec3(555,0,0), new Vec3(0,0,555), white)); 
         world.add(new Quad(new Vec3(0,0,555), new Vec3(555,0,0), new Vec3(0,555,0), white)); 
-        world.add(new Quad(new Vec3(213,554,227), new Vec3(130,0,0), new Vec3(0,0,105), lightMat)); // Ceiling Light
+        world.add(new Quad(new Vec3(213,554,227), new Vec3(130,0,0), new Vec3(0,0,105), lightMat)); 
 
-        // Configurable Objects
         let leftMat = new Metal(new Vec3(0.8, 0.8, 0.9), matConfig.roughness);
         let rightMat = new Dielectric(matConfig.ior);
         
@@ -258,7 +260,6 @@ const workerScript = `
     }
 
     self.onmessage = function(e) {
-        // Tile coordinates received here
         const { startX, startY, tileWidth, tileHeight, imageWidth, imageHeight, samples, maxDepth, camParams, lightConfig, matConfig } = e.data;
         const buffer = new Uint8ClampedArray(tileWidth * tileHeight * 4);
         const world = buildCornellBox(lightConfig, matConfig);
@@ -281,7 +282,6 @@ const workerScript = `
         let vertical = v.mul(viewport_height);
         let lower_left_corner = origin.sub(horizontal.div(2)).sub(vertical.div(2)).sub(w.mul(camParams.focus_dist));
 
-        // Setup specific bounds for this tile
         let endY = startY + tileHeight;
         let endX = startX + tileWidth;
 
@@ -325,12 +325,14 @@ const elements = {
     intensity: document.getElementById('intensitySlider'),
     color: document.getElementById('lightColorPicker'),
     roughness: document.getElementById('roughnessSlider'),
-    ior: document.getElementById('iorSlider')
+    ior: document.getElementById('iorSlider'),
+    denoise: document.getElementById('denoiseToggle')
 };
 
 let workers = [];
 let activeWorkers = 0;
 let taskQueue = [];
+let rawImageData = null; 
 
 function hexToRgb(hex) {
     let result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
@@ -341,13 +343,120 @@ function hexToRgb(hex) {
     } : { r: 1, g: 1, b: 1 };
 }
 
+// TWO-PASS ADVANCED DENOISER
+function applyDenoiser() {
+    if (!rawImageData) return;
+    statusText.innerText = "Applying Advanced 2-Pass Denoiser...";
+    
+    setTimeout(() => {
+        const width = canvas.width;
+        const height = canvas.height;
+        const data = rawImageData.data;
+        const size = width * height * 4;
+
+        // PASS 1: FIREFLY REJECTION (Neighborhood Clamping)
+        // Detects extreme black/white outliers and clamps them to the local neighbor max/min.
+        const clampedData = new Uint8ClampedArray(size);
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const idx = (y * width + x) * 4;
+
+                // Skip immediate edges for simplicity
+                if (x === 0 || x === width - 1 || y === 0 || y === height - 1) {
+                    clampedData[idx] = data[idx]; clampedData[idx+1] = data[idx+1];
+                    clampedData[idx+2] = data[idx+2]; clampedData[idx+3] = 255;
+                    continue;
+                }
+
+                let minR = 255, minG = 255, minB = 255;
+                let maxR = 0, maxG = 0, maxB = 0;
+
+                // Check the 8 surrounding neighbors
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        if (dx === 0 && dy === 0) continue;
+                        const nIdx = ((y + dy) * width + (x + dx)) * 4;
+                        const r = data[nIdx], g = data[nIdx+1], b = data[nIdx+2];
+
+                        if (r < minR) minR = r; if (r > maxR) maxR = r;
+                        if (g < minG) minG = g; if (g > maxG) maxG = g;
+                        if (b < minB) minB = b; if (b > maxB) maxB = b;
+                    }
+                }
+
+                // Clamp the center pixel to prevent extreme fireflies/dead pixels
+                clampedData[idx]   = Math.max(minR, Math.min(maxR, data[idx]));
+                clampedData[idx+1] = Math.max(minG, Math.min(maxG, data[idx+1]));
+                clampedData[idx+2] = Math.max(minB, Math.min(maxB, data[idx+2]));
+                clampedData[idx+3] = 255;
+            }
+        }
+
+        // PASS 2: BILATERAL FILTER (Edge-Preserving Blur)
+        const output = new Uint8ClampedArray(size);
+        const radius = 2; // 5x5 window
+        const sigmaSpatial = 2.0;
+        const sigmaColor = 0.25 * 255; // Color tolerance
+
+        const spatialWeights = [];
+        for (let dy = -radius; dy <= radius; dy++) {
+            for (let dx = -radius; dx <= radius; dx++) {
+                spatialWeights.push(Math.exp(-(dx*dx + dy*dy) / (2 * sigmaSpatial * sigmaSpatial)));
+            }
+        }
+
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const idx = (y * width + x) * 4;
+                const r = clampedData[idx];
+                const g = clampedData[idx+1];
+                const b = clampedData[idx+2];
+
+                let rSum = 0, gSum = 0, bSum = 0, wSum = 0;
+                let wIdx = 0;
+
+                for (let dy = -radius; dy <= radius; dy++) {
+                    const ny = y + dy;
+                    if (ny < 0 || ny >= height) { wIdx += (radius*2+1); continue; }
+
+                    const rowOffset = ny * width;
+                    for (let dx = -radius; dx <= radius; dx++) {
+                        const nx = x + dx;
+                        if (nx < 0 || nx >= width) { wIdx++; continue; }
+
+                        const nIdx = (rowOffset + nx) * 4;
+                        const nr = clampedData[nIdx];
+                        const ng = clampedData[nIdx+1];
+                        const nb = clampedData[nIdx+2];
+
+                        const distColorSq = (r-nr)*(r-nr) + (g-ng)*(g-ng) + (b-nb)*(b-nb);
+                        const colorWeight = Math.exp(-distColorSq / (2 * sigmaColor * sigmaColor));
+                        const weight = spatialWeights[wIdx++] * colorWeight;
+
+                        rSum += nr * weight; gSum += ng * weight; bSum += nb * weight;
+                        wSum += weight;
+                    }
+                }
+
+                output[idx] = rSum / wSum;
+                output[idx+1] = gSum / wSum;
+                output[idx+2] = bSum / wSum;
+                output[idx+3] = 255;
+            }
+        }
+
+        ctx.putImageData(new ImageData(output, width, height), 0, 0);
+        statusText.innerText = "Render & Denoise Complete";
+    }, 10);
+}
+
 function startRender() {
     workers.forEach(w => w.terminate());
     workers = [];
     activeWorkers = 0;
     taskQueue = [];
+    rawImageData = null;
 
-    // Clear canvas before render
     ctx.fillStyle = "black";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -376,7 +485,6 @@ function startRender() {
     const width = canvas.width;
     const height = canvas.height;
     
-    // Create the Tile Queue (64x64 buckets)
     const TILE_SIZE = 64;
     for (let y = 0; y < height; y += TILE_SIZE) {
         for (let x = 0; x < width; x += TILE_SIZE) {
@@ -389,7 +497,6 @@ function startRender() {
         }
     }
     
-    // Reversing renders it roughly center-top down which is fun to watch
     taskQueue.reverse();
 
     const numCores = navigator.hardwareConcurrency || 4; 
@@ -406,7 +513,14 @@ function startRender() {
             worker.terminate();
             activeWorkers--;
             if (activeWorkers === 0) {
-                statusText.innerText = `Finished in ${((performance.now() - startTime) / 1000).toFixed(2)}s`;
+                // RENDER COMPLETE! Cache the raw noisy data.
+                rawImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                
+                if (elements.denoise.checked) {
+                    applyDenoiser();
+                } else {
+                    statusText.innerText = `Render Finished in ${((performance.now() - startTime) / 1000).toFixed(2)}s`;
+                }
             }
         }
     }
@@ -422,7 +536,6 @@ function startRender() {
             const { startX, startY, tileWidth, tileHeight, buffer } = e.data;
             const imageData = new ImageData(new Uint8ClampedArray(buffer), tileWidth, tileHeight);
             
-            // Map the mathematical bottom-up Y coordinate to the HTML Canvas top-down Y coordinate
             const canvasY = height - startY - tileHeight;
             ctx.putImageData(imageData, startX, canvasY);
             
@@ -433,8 +546,21 @@ function startRender() {
     }
 }
 
-// Bind Events dynamically
 Object.keys(elements).forEach(key => {
+    if (key === 'denoise') {
+        elements[key].addEventListener('change', (e) => {
+            if (activeWorkers > 0) return; 
+            
+            if (e.target.checked) {
+                applyDenoiser();
+            } else if (rawImageData) {
+                ctx.putImageData(rawImageData, 0, 0);
+                statusText.innerText = "Denoiser Disabled (Showing Raw Output)";
+            }
+        });
+        return; 
+    }
+
     elements[key].addEventListener('change', (e) => {
         const valSpan = document.getElementById(key + 'Val');
         if(valSpan) {

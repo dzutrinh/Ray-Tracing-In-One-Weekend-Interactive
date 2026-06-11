@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>The Next Week (Tile-Based Final Scene)</title>
+    <title>Ray Tracing: The Next Week</title>
     <style>
         body { background-color: #1a1a1a; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin-top: 1rem; }
         canvas { background-color: black; box-shadow: 0 4px 15px rgba(0,0,0,0.8); border-radius: 4px; margin-bottom: 1rem; }
@@ -11,12 +11,13 @@
         .panel-title { font-weight: bold; margin-bottom: 0.5rem; color: #4CAF50; border-bottom: 1px solid #444; padding-bottom: 0.5rem; text-align: center; }
         .control-group { display: flex; justify-content: space-between; align-items: center; font-size: 0.9em; }
         input[type="range"] { cursor: pointer; width: 120px; }
+        input[type="checkbox"] { cursor: pointer; height: 25px; border: none; border-radius: 4px; background: none; }
         #status { font-family: monospace; color: #ffeb3b; font-weight: bold; margin-bottom: 1rem; font-size: 1.1em; }
     </style>
 </head>
 <body>
 
-    <h2>Book 2: Final Scene (Bucket Rendering)</h2>
+    <h2>Ray Tracing: The Next Week</h2>
     <div id="status">Ready</div>
     <canvas id="renderCanvas" width="500" height="500"></canvas> 
     
@@ -24,12 +25,16 @@
         <div class="control-panel">
             <div class="panel-title">Renderer Limits</div>
             <div class="control-group">
+                <label>Enable Two-pass simple denoiser:</label>
+                <input type="checkbox" id="denoiseToggle">
+            </div>
+            <div class="control-group">
                 <label>Samples/Pixel:</label>
-                <div><span id="samplesVal">20</span> <input type="range" id="samplesSlider" min="5" max="100" step="5" value="20"></div>
+                <div><span id="samplesVal">50</span> <input type="range" id="samplesSlider" min="10" max="1000" step="10" value="50"></div>
             </div>
             <div class="control-group">
                 <label>Max Bounces:</label>
-                <div><span id="depthVal">8</span> <input type="range" id="depthSlider" min="2" max="25" step="1" value="8"></div>
+                <div><span id="depthVal">8</span> <input type="range" id="depthSlider" min="2" max="40" step="1" value="8"></div>
             </div>
         </div>
 
@@ -167,6 +172,38 @@ const workerScript = `
         }
     }
 
+    // NEW: Motion Blur Sphere
+    class MovingSphere {
+        constructor(center0, center1, time0, time1, radius, material) {
+            this.center0 = center0; this.center1 = center1;
+            this.time0 = time0; this.time1 = time1;
+            this.radius = radius; this.material = material;
+        }
+        center(time) {
+            let t = (time - this.time0) / (this.time1 - this.time0);
+            return this.center0.add(this.center1.sub(this.center0).mul(t));
+        }
+        hit(ray, t_min, t_max) {
+            let current_center = this.center(ray.time);
+            let oc = ray.origin.sub(current_center);
+            let a = ray.direction.lengthSq();
+            let half_b = Vec3.dot(oc, ray.direction);
+            let c = oc.lengthSq() - this.radius * this.radius;
+            let discriminant = half_b * half_b - a * c;
+            if (discriminant < 0) return null;
+            let sqrtd = Math.sqrt(discriminant);
+            let root = (-half_b - sqrtd) / a;
+            if (root <= t_min || t_max <= root) {
+                root = (-half_b + sqrtd) / a;
+                if (root <= t_min || t_max <= root) return null;
+            }
+            let p = ray.at(root);
+            let outward_normal = p.sub(current_center).div(this.radius);
+            let front_face = Vec3.dot(ray.direction, outward_normal) < 0;
+            return { t: root, p: p, normal: front_face ? outward_normal : outward_normal.mul(-1), front_face: front_face, material: this.material };
+        }
+    }
+
     class Quad {
         constructor(Q, u, v, material) {
             this.Q = Q; this.u = u; this.v = v; this.material = material;
@@ -218,6 +255,7 @@ const workerScript = `
         }
     }
 
+    // --- TRANSFORMS & LISTS ---
     class Translate {
         constructor(obj, offset) { this.obj = obj; this.offset = offset; }
         hit(ray, t_min, t_max) {
@@ -226,6 +264,45 @@ const workerScript = `
             if (!rec) return null;
             rec.p = rec.p.add(this.offset);
             return rec;
+        }
+    }
+
+    // NEW: Proper Matrix Rotation
+    class RotateY {
+        constructor(obj, angle) {
+            this.obj = obj;
+            let radians = (Math.PI / 180.0) * angle;
+            this.sin_theta = Math.sin(radians);
+            this.cos_theta = Math.cos(radians);
+        }
+        hit(ray, t_min, t_max) {
+            let origin = new Vec3(
+                this.cos_theta * ray.origin.x - this.sin_theta * ray.origin.z,
+                ray.origin.y,
+                this.sin_theta * ray.origin.x + this.cos_theta * ray.origin.z
+            );
+            let direction = new Vec3(
+                this.cos_theta * ray.direction.x - this.sin_theta * ray.direction.z,
+                ray.direction.y,
+                this.sin_theta * ray.direction.x + this.cos_theta * ray.direction.z
+            );
+            let rotated_r = new Ray(origin, direction, ray.time);
+            
+            let rec = this.obj.hit(rotated_r, t_min, t_max);
+            if (!rec) return null;
+            
+            let p = new Vec3(
+                this.cos_theta * rec.p.x + this.sin_theta * rec.p.z,
+                rec.p.y,
+                -this.sin_theta * rec.p.x + this.cos_theta * rec.p.z
+            );
+            let normal = new Vec3(
+                this.cos_theta * rec.normal.x + this.sin_theta * rec.normal.z,
+                rec.normal.y,
+                -this.sin_theta * rec.normal.x + this.cos_theta * rec.normal.z
+            );
+            
+            return { t: rec.t, p: p, normal: normal, front_face: rec.front_face, material: rec.material };
         }
     }
 
@@ -242,15 +319,47 @@ const workerScript = `
         }
     }
 
-    function box(p0, p1, mat) {
-        let list = new HittableList();
-        list.add(new Quad(new Vec3(p0.x, p0.y, p1.z), new Vec3(p1.x-p0.x, 0, 0), new Vec3(0, p1.y-p0.y, 0), mat));
-        list.add(new Quad(new Vec3(p1.x, p0.y, p0.z), new Vec3(p0.x-p1.x, 0, 0), new Vec3(0, p1.y-p0.y, 0), mat));
-        list.add(new Quad(new Vec3(p0.x, p1.y, p1.z), new Vec3(p1.x-p0.x, 0, 0), new Vec3(0, 0, p0.z-p1.z), mat));
-        list.add(new Quad(new Vec3(p0.x, p0.y, p0.z), new Vec3(p1.x-p0.x, 0, 0), new Vec3(0, 0, p1.z-p0.z), mat));
-        list.add(new Quad(new Vec3(p1.x, p0.y, p1.z), new Vec3(0, 0, p0.z-p1.z), new Vec3(0, p1.y-p0.y, 0), mat));
-        list.add(new Quad(new Vec3(p0.x, p0.y, p0.z), new Vec3(0, 0, p1.z-p0.z), new Vec3(0, p1.y-p0.y, 0), mat));
-        return list;
+    // NEW: Lightweight AABB pseudo-BVH node to dramatically speed up JS rendering
+    class BoundingNode {
+        constructor(hittable, min, max) {
+            this.hittable = hittable;
+            this.min = min; this.max = max;
+        }
+        hit(ray, t_min, t_max) {
+            for (let a = 0; a < 3; a++) {
+                let invD = 1.0 / (a===0 ? ray.direction.x : (a===1 ? ray.direction.y : ray.direction.z));
+                let origin = a===0 ? ray.origin.x : (a===1 ? ray.origin.y : ray.origin.z);
+                let minVal = a===0 ? this.min.x : (a===1 ? this.min.y : this.min.z);
+                let maxVal = a===0 ? this.max.x : (a===1 ? this.max.y : this.max.z);
+                
+                let t0 = (minVal - origin) * invD;
+                let t1 = (maxVal - origin) * invD;
+                if (invD < 0.0) { let tmp = t0; t0 = t1; t1 = tmp; }
+                
+                t_min = t0 > t_min ? t0 : t_min;
+                t_max = t1 < t_max ? t1 : t_max;
+                if (t_max <= t_min) return null;
+            }
+            return this.hittable.hit(ray, t_min, t_max);
+        }
+    }
+
+    // NEW: True Box Construction
+    function box(a, b, mat) {
+        let sides = new HittableList();
+        let min = new Vec3(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.min(a.z, b.z));
+        let max = new Vec3(Math.max(a.x, b.x), Math.max(a.y, b.y), Math.max(a.z, b.z));
+        let dx = new Vec3(max.x - min.x, 0, 0);
+        let dy = new Vec3(0, max.y - min.y, 0);
+        let dz = new Vec3(0, 0, max.z - min.z);
+
+        sides.add(new Quad(new Vec3(min.x, min.y, max.z), dx, dy, mat)); // front
+        sides.add(new Quad(new Vec3(max.x, min.y, max.z), dz.mul(-1), dy, mat)); // right
+        sides.add(new Quad(new Vec3(max.x, min.y, min.z), dx.mul(-1), dy, mat)); // back
+        sides.add(new Quad(new Vec3(min.x, min.y, min.z), dz, dy, mat)); // left
+        sides.add(new Quad(new Vec3(min.x, max.y, max.z), dx, dz.mul(-1), mat)); // top
+        sides.add(new Quad(new Vec3(min.x, min.y, min.z), dx, dz, mat)); // bottom
+        return sides;
     }
 
     function rayColor(ray, world, depth) {
@@ -273,34 +382,37 @@ const workerScript = `
         
         // --- DETERMINISTIC SEED ---
         let seed = 9876543;
-        function seededRandom() {
+        function seededRandom(min=0, max=1) {
             seed = (seed * 9301 + 49297) % 233280;
-            return seed / 233280;
+            return min + (seed / 233280) * (max - min);
         }
 
-        // 1. GROUND BOXES
+        // 1. GROUND BOXES (Full 20x20 Grid)
         let boxes1 = new HittableList();
         let groundMat = new Lambertian(new SolidColor(new Vec3(0.48, 0.83, 0.53)));
-        let boxes_per_side = 8; 
+        let boxes_per_side = 20; 
         for(let i=0; i<boxes_per_side; i++) {
             for(let j=0; j<boxes_per_side; j++) {
-                let w = 250.0; 
+                let w = 100.0; 
                 let x0 = -1000.0 + i*w; let z0 = -1000.0 + j*w; let y0 = 0.0;
                 let x1 = x0 + w; 
-                let y1 = 1 + 100 * seededRandom();
+                let y1 = seededRandom(1, 101);
                 let z1 = z0 + w;
                 boxes1.add(box(new Vec3(x0,y0,z0), new Vec3(x1,y1,z1), groundMat));
             }
         }
-        world.add(boxes1);
+        // Wrap 2400 quads in a lightweight bounding box so it runs fast in JS
+        world.add(new BoundingNode(boxes1, new Vec3(-1000, 0, -1000), new Vec3(1000, 102, 1000)));
 
         // 2. LIGHT Panel
         let light = new DiffuseLight(new Vec3(7, 7, 7));
         world.add(new Quad(new Vec3(123,554,147), new Vec3(300,0,0), new Vec3(0,0,265), light));
 
-        // 3. Central Spheres
+        // 3. Central Spheres (With Proper Motion Blur!)
         let center1 = new Vec3(400, 400, 200);
-        world.add(new Sphere(center1, 50, new Lambertian(new SolidColor(new Vec3(0.7, 0.3, 0.1))))); 
+        let center2 = center1.add(new Vec3(30, 0, 0));
+        world.add(new MovingSphere(center1, center2, 0, 1, 50, new Lambertian(new SolidColor(new Vec3(0.7, 0.3, 0.1))))); 
+
         world.add(new Sphere(new Vec3(260, 150, 45), 50, new Dielectric(1.5))); 
         world.add(new Sphere(new Vec3(0, 150, 145), 50, new Metal(new Vec3(0.8, 0.8, 0.9), 1.0))); 
 
@@ -314,26 +426,30 @@ const workerScript = `
         world.add(new ConstantMedium(universe, cfg.globalFog, new Vec3(1, 1, 1)));
 
         // 6. Two Noise Spheres
-        let noiseMat = new Lambertian(new NoiseTexture(0.1));
+        let noiseMat = new Lambertian(new NoiseTexture(0.2));
         world.add(new Sphere(new Vec3(220, 280, 300), 80, noiseMat));
-        world.add(new Sphere(new Vec3(400, 200, 400), 100, noiseMat)); 
+        
+        let earthMat = new Lambertian(new SolidColor(new Vec3(0.2, 0.3, 0.6))); 
+        world.add(new Sphere(new Vec3(400, 200, 400), 100, earthMat)); 
 
-        // 7. Translated Block Cluster
+        // 7. Translated & Rotated Block Cluster (Full 1000 spheres)
         let boxes2 = new HittableList();
         let white = new Lambertian(new SolidColor(new Vec3(0.73, 0.73, 0.73)));
-        for(let j=0; j<80; j++) {
-            let rx = 165 * seededRandom(); 
-            let ry = 165 * seededRandom(); 
-            let rz = 165 * seededRandom(); 
+        for(let j=0; j<1000; j++) {
+            let rx = seededRandom(0, 165); 
+            let ry = seededRandom(0, 165); 
+            let rz = seededRandom(0, 165); 
             boxes2.add(new Sphere(new Vec3(rx, ry, rz), 10, white));
         }
-        world.add(new Translate(boxes2, new Vec3(-100, 270, 395)));
+        
+        // Wrap 1000 spheres in a bounding box, then rotate and translate them
+        let clusterNode = new BoundingNode(boxes2, new Vec3(0,0,0), new Vec3(175,175,175));
+        world.add(new Translate(new RotateY(clusterNode, 15), new Vec3(-100, 270, 395)));
 
         return world;
     }
 
     self.onmessage = function(e) {
-        // Updated to receive tile coordinates
         const { startX, startY, tileWidth, tileHeight, imageWidth, imageHeight, cfg } = e.data;
         const buffer = new Uint8ClampedArray(tileWidth * tileHeight * 4);
         const world = buildScene(cfg);
@@ -355,7 +471,6 @@ const workerScript = `
         let vertical = v.mul(viewport_height);
         let lower_left_corner = origin.sub(horizontal.div(2)).sub(vertical.div(2)).sub(w);
 
-        // Calculate exact bounds for this tile
         let endY = startY + tileHeight;
         let endX = startX + tileWidth;
 
@@ -367,6 +482,8 @@ const workerScript = `
                     let s_u = (i + Math.random()) / (imageWidth - 1);
                     let s_v = (j + Math.random()) / (imageHeight - 1);
                     let dir = lower_left_corner.add(horizontal.mul(s_u)).add(vertical.mul(s_v)).sub(origin);
+                    
+                    // Assign random ray time for Motion Blur!
                     let r = new Ray(origin, dir, Math.random());
                     pixel_color = pixel_color.add(rayColor(r, world, cfg.depth));
                 }
@@ -397,21 +514,107 @@ const elements = {
     samples: document.getElementById('samplesSlider'),
     depth: document.getElementById('depthSlider'),
     globalFog: document.getElementById('globalFogSlider'),
-    fog: document.getElementById('fogSlider')
+    fog: document.getElementById('fogSlider'),
+    denoise: document.getElementById('denoiseToggle')
 };
 
 let workers = [];
 let activeWorkers = 0;
 let taskQueue = [];
+let rawImageData = null;
+
+function applyDenoiser() {
+    if (!rawImageData) return;
+    statusText.innerText = "Applying Advanced 2-Pass Denoiser...";
+    
+    setTimeout(() => {
+        const width = canvas.width;
+        const height = canvas.height;
+        const data = rawImageData.data;
+        const size = width * height * 4;
+
+        // PASS 1: FIREFLY REJECTION
+        const clampedData = new Uint8ClampedArray(size);
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const idx = (y * width + x) * 4;
+                if (x === 0 || x === width - 1 || y === 0 || y === height - 1) {
+                    clampedData[idx] = data[idx]; clampedData[idx+1] = data[idx+1];
+                    clampedData[idx+2] = data[idx+2]; clampedData[idx+3] = 255; continue;
+                }
+                let minR = 255, minG = 255, minB = 255;
+                let maxR = 0, maxG = 0, maxB = 0;
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        if (dx === 0 && dy === 0) continue;
+                        const nIdx = ((y + dy) * width + (x + dx)) * 4;
+                        const r = data[nIdx], g = data[nIdx+1], b = data[nIdx+2];
+                        if (r < minR) minR = r; if (r > maxR) maxR = r;
+                        if (g < minG) minG = g; if (g > maxG) maxG = g;
+                        if (b < minB) minB = b; if (b > maxB) maxB = b;
+                    }
+                }
+                clampedData[idx]   = Math.max(minR, Math.min(maxR, data[idx]));
+                clampedData[idx+1] = Math.max(minG, Math.min(maxG, data[idx+1]));
+                clampedData[idx+2] = Math.max(minB, Math.min(maxB, data[idx+2]));
+                clampedData[idx+3] = 255;
+            }
+        }
+
+        // PASS 2: BILATERAL FILTER
+        const output = new Uint8ClampedArray(size);
+        const radius = 2; 
+        const sigmaSpatial = 2.0;
+        const sigmaColor = 0.25 * 255; 
+
+        const spatialWeights = [];
+        for (let dy = -radius; dy <= radius; dy++) {
+            for (let dx = -radius; dx <= radius; dx++) {
+                spatialWeights.push(Math.exp(-(dx*dx + dy*dy) / (2 * sigmaSpatial * sigmaSpatial)));
+            }
+        }
+
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const idx = (y * width + x) * 4;
+                const r = clampedData[idx]; const g = clampedData[idx+1]; const b = clampedData[idx+2];
+                let rSum = 0, gSum = 0, bSum = 0, wSum = 0; let wIdx = 0;
+
+                for (let dy = -radius; dy <= radius; dy++) {
+                    const ny = y + dy;
+                    if (ny < 0 || ny >= height) { wIdx += (radius*2+1); continue; }
+                    const rowOffset = ny * width;
+                    for (let dx = -radius; dx <= radius; dx++) {
+                        const nx = x + dx;
+                        if (nx < 0 || nx >= width) { wIdx++; continue; }
+                        const nIdx = (rowOffset + nx) * 4;
+                        const nr = clampedData[nIdx]; const ng = clampedData[nIdx+1]; const nb = clampedData[nIdx+2];
+
+                        const distColorSq = (r-nr)*(r-nr) + (g-ng)*(g-ng) + (b-nb)*(b-nb);
+                        const colorWeight = Math.exp(-distColorSq / (2 * sigmaColor * sigmaColor));
+                        const weight = spatialWeights[wIdx++] * colorWeight;
+
+                        rSum += nr * weight; gSum += ng * weight; bSum += nb * weight;
+                        wSum += weight;
+                    }
+                }
+                output[idx] = rSum / wSum; output[idx+1] = gSum / wSum;
+                output[idx+2] = bSum / wSum; output[idx+3] = 255;
+            }
+        }
+
+        ctx.putImageData(new ImageData(output, width, height), 0, 0);
+        statusText.innerText = "Render & Denoise Complete";
+    }, 10);
+}
 
 function startRender() {
-    // Terminate old workers and reset
     workers.forEach(w => w.terminate());
     workers = [];
     activeWorkers = 0;
     taskQueue = [];
+    rawImageData = null;
 
-    // Clear the canvas
     ctx.fillStyle = "black";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -425,7 +628,6 @@ function startRender() {
     const width = canvas.width;
     const height = canvas.height;
     
-    // Create the Tile Queue (64x64 buckets)
     const TILE_SIZE = 64;
     for (let y = 0; y < height; y += TILE_SIZE) {
         for (let x = 0; x < width; x += TILE_SIZE) {
@@ -438,14 +640,17 @@ function startRender() {
         }
     }
     
-    // Reverse the queue so we render from center/top down (optional visual trick)
-    taskQueue.reverse();
+    // Sort from center outward so the coolest stuff renders first!
+    taskQueue.sort((a, b) => {
+        let distA = Math.pow(a.startX - width/2, 2) + Math.pow(a.startY - height/2, 2);
+        let distB = Math.pow(b.startX - width/2, 2) + Math.pow(b.startY - height/2, 2);
+        return distA - distB;
+    });
 
     const numCores = navigator.hardwareConcurrency || 4; 
-    statusText.innerText = `Calculating Final Scene... (${numCores} threads, ${taskQueue.length} tiles)`;
+    statusText.innerText = `Calculating Final Scene... (${numCores} threads)`;
     let startTime = performance.now();
 
-    // The function that keeps feeding workers new tiles
     function assignNextTask(worker) {
         if (taskQueue.length > 0) {
             const task = taskQueue.shift();
@@ -456,12 +661,16 @@ function startRender() {
             worker.terminate();
             activeWorkers--;
             if (activeWorkers === 0) {
-                statusText.innerText = `Render Finished in ${((performance.now() - startTime) / 1000).toFixed(2)}s`;
+                rawImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                if (elements.denoise.checked) {
+                    applyDenoiser();
+                } else {
+                    statusText.innerText = `Render Finished in ${((performance.now() - startTime) / 1000).toFixed(2)}s`;
+                }
             }
         }
     }
 
-    // Spawn workers and get them started
     for (let i = 0; i < numCores; i++) {
         if (taskQueue.length === 0) break;
         
@@ -473,11 +682,9 @@ function startRender() {
             const { startX, startY, tileWidth, tileHeight, buffer } = e.data;
             const imageData = new ImageData(new Uint8ClampedArray(buffer), tileWidth, tileHeight);
             
-            // Map the mathematical bottom-up Y coordinate to the HTML Canvas top-down Y coordinate
             const canvasY = height - startY - tileHeight;
             ctx.putImageData(imageData, startX, canvasY);
             
-            // Immediately grab the next tile
             assignNextTask(worker);
         };
 
@@ -486,6 +693,18 @@ function startRender() {
 }
 
 Object.keys(elements).forEach(key => {
+    if (key === 'denoise') {
+        elements[key].addEventListener('change', (e) => {
+            if (activeWorkers > 0) return; 
+            if (e.target.checked) applyDenoiser();
+            else if (rawImageData) {
+                ctx.putImageData(rawImageData, 0, 0);
+                statusText.innerText = "Denoiser Disabled (Showing Raw Output)";
+            }
+        });
+        return; 
+    }
+
     elements[key].addEventListener('change', (e) => {
         const valSpan = document.getElementById(key + 'Val');
         if(valSpan) { valSpan.innerText = e.target.value; }
