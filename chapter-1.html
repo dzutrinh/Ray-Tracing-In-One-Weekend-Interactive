@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Ray Tracing in One Weekend</title>
+    <title>Ray Tracing in One Weekend (Tile-Based Rendering)</title>
     <style>
         body { background-color: #1a1a1a; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin-top: 1rem; }
         canvas { background-color: black; box-shadow: 0 4px 8px rgba(0,0,0,0.5); border-radius: 4px; margin-bottom: 1rem; }
@@ -16,7 +16,9 @@
 
     <h2>Ray Tracing in One Weekend</h2>
     <div id="status">Ready</div>
-    <canvas id="renderCanvas" width="600" height="337"></canvas> <div class="controls">
+    <canvas id="renderCanvas" width="600" height="337"></canvas> 
+    
+    <div class="controls">
         <div class="control-group">
             <label>Field of View: <span id="fovVal">20</span>°</label>
             <input type="range" id="fovSlider" min="10" max="90" value="20">
@@ -26,12 +28,12 @@
             <input type="range" id="focusSlider" min="2" max="20" step="0.1" value="10.0">
         </div>
         <div class="control-group">
-            <label>Lens Blur (Aperture): <span id="blurVal">0.6</span></label>
+            <label>Lens Blur: <span id="blurVal">0.6</span></label>
             <input type="range" id="blurSlider" min="0" max="2" step="0.1" value="0.6">
         </div>
         <div class="control-group">
             <label>Samples/Pixel: <span id="samplesVal">10</span></label>
-            <input type="range" id="samplesSlider" min="1" max="100" value="10">
+            <input type="range" id="samplesSlider" min="1" max="500" value="10">
         </div>
     </div>
 
@@ -57,7 +59,6 @@ const workerScript = `
             }
         }
         static randomUnitVector() { return Vec3.randomInUnitSphere().normalize(); }
-        // NEW: Used for the physical camera lens blur
         static randomInUnitDisk() {
             while (true) {
                 let p = new Vec3(-1 + Math.random()*2, -1 + Math.random()*2, 0);
@@ -218,14 +219,14 @@ const workerScript = `
     const world = buildScene();
 
     self.onmessage = function(e) {
-        const { startY, endY, width, height, samples, maxDepth, camParams } = e.data;
-        const buffer = new Uint8ClampedArray((endY - startY) * width * 4);
+        // Tile coordinates added here
+        const { startX, startY, tileWidth, tileHeight, imageWidth, imageHeight, samples, maxDepth, camParams } = e.data;
+        const buffer = new Uint8ClampedArray(tileWidth * tileHeight * 4);
         
-        // --- FULL POSITIONABLE CAMERA MATH ---
         let theta = camParams.vfov * Math.PI / 180.0;
         let h = Math.tan(theta/2);
         let viewport_height = 2.0 * h * camParams.focus_dist;
-        let viewport_width = viewport_height * (width / height);
+        let viewport_width = viewport_height * (imageWidth / imageHeight);
 
         let lookfrom = new Vec3(camParams.lookfrom.x, camParams.lookfrom.y, camParams.lookfrom.z);
         let lookat = new Vec3(camParams.lookat.x, camParams.lookat.y, camParams.lookat.z);
@@ -243,16 +244,19 @@ const workerScript = `
         let defocus_radius = camParams.focus_dist * Math.tan((camParams.defocus_angle / 2) * Math.PI / 180.0);
         let defocus_disk_u = u.mul(defocus_radius);
         let defocus_disk_v = v.mul(defocus_radius);
-        // -------------------------------------
 
+        // Rendering specific tile bounds
+        let endY = startY + tileHeight;
+        let endX = startX + tileWidth;
+
+        let ptr = 0;
         for (let j = endY - 1; j >= startY; --j) {
-            for (let i = 0; i < width; ++i) {
+            for (let i = startX; i < endX; ++i) {
                 let pixel_color = new Vec3(0, 0, 0);
                 for (let s = 0; s < samples; ++s) {
-                    let s_u = (i + Math.random()) / (width - 1);
-                    let s_v = (j + Math.random()) / (height - 1);
+                    let s_u = (i + Math.random()) / (imageWidth - 1);
+                    let s_v = (j + Math.random()) / (imageHeight - 1);
                     
-                    // Defocus Blur calculations
                     let rd = Vec3.randomInUnitDisk().mul(defocus_radius);
                     let offset = defocus_disk_u.mul(rd.x).add(defocus_disk_v.mul(rd.y));
                     let ray_origin = (camParams.defocus_angle <= 0) ? origin : origin.add(offset);
@@ -267,15 +271,15 @@ const workerScript = `
                 let c_g = Math.sqrt(pixel_color.y * scale);
                 let c_b = Math.sqrt(pixel_color.z * scale);
                 
-                let canvasY = (endY - 1 - j);
-                let ptr = (canvasY * width + i) * 4;
-                buffer[ptr]   = 256 * Math.max(0.0, Math.min(0.999, c_r));
-                buffer[ptr+1] = 256 * Math.max(0.0, Math.min(0.999, c_g));
-                buffer[ptr+2] = 256 * Math.max(0.0, Math.min(0.999, c_b));
-                buffer[ptr+3] = 255;
+                buffer[ptr++] = 256 * Math.max(0.0, Math.min(0.999, c_r));
+                buffer[ptr++] = 256 * Math.max(0.0, Math.min(0.999, c_g));
+                buffer[ptr++] = 256 * Math.max(0.0, Math.min(0.999, c_b));
+                buffer[ptr++] = 255;
             }
         }
-        self.postMessage({ startY, endY, buffer }, [buffer.buffer]);
+        
+        // Pass the finished tile back to the main thread
+        self.postMessage({ startX, startY, tileWidth, tileHeight, buffer }, [buffer.buffer]);
     };
 `;
 
@@ -292,19 +296,23 @@ const samplesSlider = document.getElementById('samplesSlider');
 
 let workers = [];
 let activeWorkers = 0;
+let taskQueue = [];
 
 function startRender() {
     workers.forEach(w => w.terminate());
     workers = [];
     activeWorkers = 0;
+    taskQueue = [];
 
-    // Hardcoded Book Variables
+    // Clear canvas before new render
+    ctx.fillStyle = "black";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
     const lookfrom = {x: 13, y: 2, z: 3};
     const lookat = {x: 0, y: 0, z: 0};
     const vup = {x: 0, y: 1, z: 0};
-    const maxDepth = 10; // Keep at 10 for browser sanity, book uses 50
+    const maxDepth = 10; 
 
-    // Dynamic Variables
     const camParams = {
         lookfrom, lookat, vup,
         vfov: parseFloat(fovSlider.value),
@@ -316,31 +324,65 @@ function startRender() {
     const width = canvas.width;
     const height = canvas.height;
     
+    // Create the Tile Queue (64x64 buckets)
+    const TILE_SIZE = 64;
+    for (let y = 0; y < height; y += TILE_SIZE) {
+        for (let x = 0; x < width; x += TILE_SIZE) {
+            taskQueue.push({
+                startX: x,
+                startY: y,
+                tileWidth: Math.min(TILE_SIZE, width - x),
+                tileHeight: Math.min(TILE_SIZE, height - y)
+            });
+        }
+    }
+    
+    // Optional: Shuffle the queue to render random buckets, or sort to render center-first!
+    // For now, we leave it linear (bottom to top, left to right).
+
     const numCores = navigator.hardwareConcurrency || 4; 
-    statusText.innerText = `Rendering with ${numCores} threads...`;
+    statusText.innerText = `Rendering with ${numCores} threads... (${taskQueue.length} tiles)`;
     let startTime = performance.now();
-    const chunkHeight = Math.ceil(height / numCores);
 
-    for (let i = 0; i < numCores; i++) {
-        const worker = new Worker(workerUrl);
-        workers.push(worker);
-        const startY = i * chunkHeight;
-        const endY = Math.min(startY + chunkHeight, height);
-        if (startY >= height) break;
-
-        activeWorkers++;
-        worker.onmessage = (e) => {
-            const { startY: retStartY, endY: retEndY, buffer } = e.data;
-            const imageData = new ImageData(new Uint8ClampedArray(buffer), width, retEndY - retStartY);
-            ctx.putImageData(imageData, 0, height - retEndY);
-            
+    // Helper function to dispatch the next tile to a specific worker
+    function assignNextTask(worker) {
+        if (taskQueue.length > 0) {
+            const task = taskQueue.shift();
+            worker.postMessage({
+                ...task, imageWidth: width, imageHeight: height, samples, maxDepth, camParams
+            });
+        } else {
+            worker.terminate();
             activeWorkers--;
             if (activeWorkers === 0) {
                 statusText.innerText = `Finished in ${((performance.now() - startTime) / 1000).toFixed(2)}s`;
             }
+        }
+    }
+
+    // Spawn workers and assign them their first tasks
+    for (let i = 0; i < numCores; i++) {
+        if (taskQueue.length === 0) break;
+        
+        const worker = new Worker(workerUrl);
+        workers.push(worker);
+        activeWorkers++;
+
+        worker.onmessage = (e) => {
+            const { startX, startY, tileWidth, tileHeight, buffer } = e.data;
+            
+            // Draw the completed tile to the canvas
+            const imageData = new ImageData(new Uint8ClampedArray(buffer), tileWidth, tileHeight);
+            
+            // Canvas Y is inverted compared to ray tracer mathematical Y
+            const canvasY = height - startY - tileHeight;
+            ctx.putImageData(imageData, startX, canvasY);
+            
+            // Instantly assign the next tile to the worker that just finished
+            assignNextTask(worker);
         };
 
-        worker.postMessage({ startY, endY, width, height, samples, maxDepth, camParams });
+        assignNextTask(worker);
     }
 }
 

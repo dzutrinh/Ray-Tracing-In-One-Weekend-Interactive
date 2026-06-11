@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Ray Tracing - The Next Week</title>
+    <title>The Next Week (Tile-Based Final Scene)</title>
     <style>
         body { background-color: #1a1a1a; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin-top: 1rem; }
         canvas { background-color: black; box-shadow: 0 4px 15px rgba(0,0,0,0.8); border-radius: 4px; margin-bottom: 1rem; }
@@ -16,7 +16,7 @@
 </head>
 <body>
 
-    <h2>Ray Tracing - The Next Week</h2>
+    <h2>Book 2: Final Scene (Bucket Rendering)</h2>
     <div id="status">Ready</div>
     <canvas id="renderCanvas" width="500" height="500"></canvas> 
     
@@ -271,14 +271,14 @@ const workerScript = `
     function buildScene(cfg) {
         let world = new HittableList();
         
-        // --- THE FIX: Seeded Random Generator ---
+        // --- DETERMINISTIC SEED ---
         let seed = 9876543;
         function seededRandom() {
             seed = (seed * 9301 + 49297) % 233280;
             return seed / 233280;
         }
 
-        // 1. GROUND BOXES (DETERMINISTIC)
+        // 1. GROUND BOXES
         let boxes1 = new HittableList();
         let groundMat = new Lambertian(new SolidColor(new Vec3(0.48, 0.83, 0.53)));
         let boxes_per_side = 8; 
@@ -287,7 +287,7 @@ const workerScript = `
                 let w = 250.0; 
                 let x0 = -1000.0 + i*w; let z0 = -1000.0 + j*w; let y0 = 0.0;
                 let x1 = x0 + w; 
-                let y1 = 1 + 100 * seededRandom(); // Fixed here
+                let y1 = 1 + 100 * seededRandom();
                 let z1 = z0 + w;
                 boxes1.add(box(new Vec3(x0,y0,z0), new Vec3(x1,y1,z1), groundMat));
             }
@@ -318,13 +318,13 @@ const workerScript = `
         world.add(new Sphere(new Vec3(220, 280, 300), 80, noiseMat));
         world.add(new Sphere(new Vec3(400, 200, 400), 100, noiseMat)); 
 
-        // 7. Translated Block Cluster (DETERMINISTIC)
+        // 7. Translated Block Cluster
         let boxes2 = new HittableList();
         let white = new Lambertian(new SolidColor(new Vec3(0.73, 0.73, 0.73)));
         for(let j=0; j<80; j++) {
-            let rx = 165 * seededRandom(); // Fixed here
-            let ry = 165 * seededRandom(); // Fixed here
-            let rz = 165 * seededRandom(); // Fixed here
+            let rx = 165 * seededRandom(); 
+            let ry = 165 * seededRandom(); 
+            let rz = 165 * seededRandom(); 
             boxes2.add(new Sphere(new Vec3(rx, ry, rz), 10, white));
         }
         world.add(new Translate(boxes2, new Vec3(-100, 270, 395)));
@@ -333,8 +333,9 @@ const workerScript = `
     }
 
     self.onmessage = function(e) {
-        const { startY, endY, width, height, cfg } = e.data;
-        const buffer = new Uint8ClampedArray((endY - startY) * width * 4);
+        // Updated to receive tile coordinates
+        const { startX, startY, tileWidth, tileHeight, imageWidth, imageHeight, cfg } = e.data;
+        const buffer = new Uint8ClampedArray(tileWidth * tileHeight * 4);
         const world = buildScene(cfg);
 
         let lookfrom = new Vec3(478, 278, -600);
@@ -343,7 +344,7 @@ const workerScript = `
         let theta = 40 * Math.PI / 180.0;
         let h = Math.tan(theta/2);
         let viewport_height = 2.0 * h;
-        let viewport_width = viewport_height * (width / height);
+        let viewport_width = viewport_height * (imageWidth / imageHeight);
 
         let w = lookfrom.sub(lookat).normalize();
         let u = Vec3.cross(vup, w).normalize();
@@ -354,12 +355,17 @@ const workerScript = `
         let vertical = v.mul(viewport_height);
         let lower_left_corner = origin.sub(horizontal.div(2)).sub(vertical.div(2)).sub(w);
 
+        // Calculate exact bounds for this tile
+        let endY = startY + tileHeight;
+        let endX = startX + tileWidth;
+
+        let ptr = 0;
         for (let j = endY - 1; j >= startY; --j) {
-            for (let i = 0; i < width; ++i) {
+            for (let i = startX; i < endX; ++i) {
                 let pixel_color = new Vec3(0, 0, 0);
                 for (let s = 0; s < cfg.samples; ++s) {
-                    let s_u = (i + Math.random()) / (width - 1);
-                    let s_v = (j + Math.random()) / (height - 1);
+                    let s_u = (i + Math.random()) / (imageWidth - 1);
+                    let s_v = (j + Math.random()) / (imageHeight - 1);
                     let dir = lower_left_corner.add(horizontal.mul(s_u)).add(vertical.mul(s_v)).sub(origin);
                     let r = new Ray(origin, dir, Math.random());
                     pixel_color = pixel_color.add(rayColor(r, world, cfg.depth));
@@ -370,15 +376,14 @@ const workerScript = `
                 let c_g = Math.sqrt(pixel_color.y * scale);
                 let c_b = Math.sqrt(pixel_color.z * scale);
                 
-                let canvasY = (endY - 1 - j);
-                let ptr = (canvasY * width + i) * 4;
-                buffer[ptr]   = 256 * Math.max(0.0, Math.min(0.999, c_r));
-                buffer[ptr+1] = 256 * Math.max(0.0, Math.min(0.999, c_g));
-                buffer[ptr+2] = 256 * Math.max(0.0, Math.min(0.999, c_b));
-                buffer[ptr+3] = 255;
+                buffer[ptr++] = 256 * Math.max(0.0, Math.min(0.999, c_r));
+                buffer[ptr++] = 256 * Math.max(0.0, Math.min(0.999, c_g));
+                buffer[ptr++] = 256 * Math.max(0.0, Math.min(0.999, c_b));
+                buffer[ptr++] = 255;
             }
         }
-        self.postMessage({ startY, endY, buffer }, [buffer.buffer]);
+        
+        self.postMessage({ startX, startY, tileWidth, tileHeight, buffer }, [buffer.buffer]);
     };
 `;
 
@@ -397,11 +402,18 @@ const elements = {
 
 let workers = [];
 let activeWorkers = 0;
+let taskQueue = [];
 
 function startRender() {
+    // Terminate old workers and reset
     workers.forEach(w => w.terminate());
     workers = [];
     activeWorkers = 0;
+    taskQueue = [];
+
+    // Clear the canvas
+    ctx.fillStyle = "black";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     const cfg = {
         samples: parseInt(elements.samples.value),
@@ -413,31 +425,63 @@ function startRender() {
     const width = canvas.width;
     const height = canvas.height;
     
+    // Create the Tile Queue (64x64 buckets)
+    const TILE_SIZE = 64;
+    for (let y = 0; y < height; y += TILE_SIZE) {
+        for (let x = 0; x < width; x += TILE_SIZE) {
+            taskQueue.push({
+                startX: x,
+                startY: y,
+                tileWidth: Math.min(TILE_SIZE, width - x),
+                tileHeight: Math.min(TILE_SIZE, height - y)
+            });
+        }
+    }
+    
+    // Reverse the queue so we render from center/top down (optional visual trick)
+    taskQueue.reverse();
+
     const numCores = navigator.hardwareConcurrency || 4; 
-    statusText.innerText = `Calculating Final Scene... (${numCores} threads)`;
+    statusText.innerText = `Calculating Final Scene... (${numCores} threads, ${taskQueue.length} tiles)`;
     let startTime = performance.now();
-    const chunkHeight = Math.ceil(height / numCores);
 
-    for (let i = 0; i < numCores; i++) {
-        const worker = new Worker(workerUrl);
-        workers.push(worker);
-        const startY = i * chunkHeight;
-        const endY = Math.min(startY + chunkHeight, height);
-        if (startY >= height) break;
-
-        activeWorkers++;
-        worker.onmessage = (e) => {
-            const { startY: retStartY, endY: retEndY, buffer } = e.data;
-            const imageData = new ImageData(new Uint8ClampedArray(buffer), width, retEndY - retStartY);
-            ctx.putImageData(imageData, 0, height - retEndY);
-            
+    // The function that keeps feeding workers new tiles
+    function assignNextTask(worker) {
+        if (taskQueue.length > 0) {
+            const task = taskQueue.shift();
+            worker.postMessage({
+                ...task, imageWidth: width, imageHeight: height, cfg
+            });
+        } else {
+            worker.terminate();
             activeWorkers--;
             if (activeWorkers === 0) {
                 statusText.innerText = `Render Finished in ${((performance.now() - startTime) / 1000).toFixed(2)}s`;
             }
+        }
+    }
+
+    // Spawn workers and get them started
+    for (let i = 0; i < numCores; i++) {
+        if (taskQueue.length === 0) break;
+        
+        const worker = new Worker(workerUrl);
+        workers.push(worker);
+        activeWorkers++;
+
+        worker.onmessage = (e) => {
+            const { startX, startY, tileWidth, tileHeight, buffer } = e.data;
+            const imageData = new ImageData(new Uint8ClampedArray(buffer), tileWidth, tileHeight);
+            
+            // Map the mathematical bottom-up Y coordinate to the HTML Canvas top-down Y coordinate
+            const canvasY = height - startY - tileHeight;
+            ctx.putImageData(imageData, startX, canvasY);
+            
+            // Immediately grab the next tile
+            assignNextTask(worker);
         };
 
-        worker.postMessage({ startY, endY, width, height, cfg });
+        assignNextTask(worker);
     }
 }
 

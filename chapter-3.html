@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Ray Tracing: The Rest of Your Life</title>
+    <title>Ray Tracing: The Rest of Your Life (Bucket Rendering)</title>
     <style>
         body { background-color: #1a1a1a; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin-top: 1rem; }
         canvas { background-color: black; box-shadow: 0 4px 15px rgba(0,0,0,0.8); border-radius: 4px; margin-bottom: 1rem; }
@@ -26,7 +26,7 @@
             <div class="panel-title">Render Engine</div>
             <div class="control-group">
                 <label>Samples/Pixel:</label>
-                <div><span id="samplesVal">20</span> <input type="range" id="samplesSlider" min="1" max="200" step="1" value="20"></div>
+                <div><span id="samplesVal">20</span> <input type="range" id="samplesSlider" min="1" max="1024" step="1" value="50"></div>
             </div>
             <div class="control-group">
                 <label>Max Bounce Depth:</label>
@@ -251,21 +251,22 @@ const workerScript = `
         let leftMat = new Metal(new Vec3(0.8, 0.8, 0.9), matConfig.roughness);
         let rightMat = new Dielectric(matConfig.ior);
         
-        world.add(new Sphere(new Vec3(180, 100, 350), 100, leftMat));  // Left Object (Further back)
-        world.add(new Sphere(new Vec3(380, 100, 200), 100, rightMat)); // Right Object (Closer)
+        world.add(new Sphere(new Vec3(180, 100, 350), 100, leftMat));  
+        world.add(new Sphere(new Vec3(380, 100, 200), 100, rightMat)); 
 
         return world;
     }
 
     self.onmessage = function(e) {
-        const { startY, endY, width, height, samples, maxDepth, camParams, lightConfig, matConfig } = e.data;
-        const buffer = new Uint8ClampedArray((endY - startY) * width * 4);
+        // Tile coordinates received here
+        const { startX, startY, tileWidth, tileHeight, imageWidth, imageHeight, samples, maxDepth, camParams, lightConfig, matConfig } = e.data;
+        const buffer = new Uint8ClampedArray(tileWidth * tileHeight * 4);
         const world = buildCornellBox(lightConfig, matConfig);
 
         let theta = camParams.vfov * Math.PI / 180.0;
         let h = Math.tan(theta/2);
         let viewport_height = 2.0 * h * camParams.focus_dist;
-        let viewport_width = viewport_height * (width / height);
+        let viewport_width = viewport_height * (imageWidth / imageHeight);
 
         let lookfrom = new Vec3(camParams.lookfrom.x, camParams.lookfrom.y, camParams.lookfrom.z);
         let lookat = new Vec3(camParams.lookat.x, camParams.lookat.y, camParams.lookat.z);
@@ -280,12 +281,17 @@ const workerScript = `
         let vertical = v.mul(viewport_height);
         let lower_left_corner = origin.sub(horizontal.div(2)).sub(vertical.div(2)).sub(w.mul(camParams.focus_dist));
 
+        // Setup specific bounds for this tile
+        let endY = startY + tileHeight;
+        let endX = startX + tileWidth;
+
+        let ptr = 0;
         for (let j = endY - 1; j >= startY; --j) {
-            for (let i = 0; i < width; ++i) {
+            for (let i = startX; i < endX; ++i) {
                 let pixel_color = new Vec3(0, 0, 0);
                 for (let s = 0; s < samples; ++s) {
-                    let s_u = (i + Math.random()) / (width - 1);
-                    let s_v = (j + Math.random()) / (height - 1);
+                    let s_u = (i + Math.random()) / (imageWidth - 1);
+                    let s_v = (j + Math.random()) / (imageHeight - 1);
                     
                     let dir = lower_left_corner.add(horizontal.mul(s_u)).add(vertical.mul(s_v)).sub(origin);
                     let r = new Ray(origin, dir);
@@ -297,15 +303,13 @@ const workerScript = `
                 let c_g = Math.sqrt(pixel_color.y * scale);
                 let c_b = Math.sqrt(pixel_color.z * scale);
                 
-                let canvasY = (endY - 1 - j);
-                let ptr = (canvasY * width + i) * 4;
-                buffer[ptr]   = 256 * Math.max(0.0, Math.min(0.999, c_r));
-                buffer[ptr+1] = 256 * Math.max(0.0, Math.min(0.999, c_g));
-                buffer[ptr+2] = 256 * Math.max(0.0, Math.min(0.999, c_b));
-                buffer[ptr+3] = 255;
+                buffer[ptr++] = 256 * Math.max(0.0, Math.min(0.999, c_r));
+                buffer[ptr++] = 256 * Math.max(0.0, Math.min(0.999, c_g));
+                buffer[ptr++] = 256 * Math.max(0.0, Math.min(0.999, c_b));
+                buffer[ptr++] = 255;
             }
         }
-        self.postMessage({ startY, endY, buffer }, [buffer.buffer]);
+        self.postMessage({ startX, startY, tileWidth, tileHeight, buffer }, [buffer.buffer]);
     };
 `;
 
@@ -315,7 +319,6 @@ const statusText = document.getElementById('status');
 const blob = new Blob([workerScript], { type: 'application/javascript' });
 const workerUrl = URL.createObjectURL(blob);
 
-// DOM Elements
 const elements = {
     samples: document.getElementById('samplesSlider'),
     depth: document.getElementById('depthSlider'),
@@ -327,6 +330,7 @@ const elements = {
 
 let workers = [];
 let activeWorkers = 0;
+let taskQueue = [];
 
 function hexToRgb(hex) {
     let result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
@@ -341,6 +345,11 @@ function startRender() {
     workers.forEach(w => w.terminate());
     workers = [];
     activeWorkers = 0;
+    taskQueue = [];
+
+    // Clear canvas before render
+    ctx.fillStyle = "black";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     const camParams = {
         lookfrom: {x: 278, y: 278, z: -800},
@@ -367,41 +376,68 @@ function startRender() {
     const width = canvas.width;
     const height = canvas.height;
     
+    // Create the Tile Queue (64x64 buckets)
+    const TILE_SIZE = 64;
+    for (let y = 0; y < height; y += TILE_SIZE) {
+        for (let x = 0; x < width; x += TILE_SIZE) {
+            taskQueue.push({
+                startX: x,
+                startY: y,
+                tileWidth: Math.min(TILE_SIZE, width - x),
+                tileHeight: Math.min(TILE_SIZE, height - y)
+            });
+        }
+    }
+    
+    // Reversing renders it roughly center-top down which is fun to watch
+    taskQueue.reverse();
+
     const numCores = navigator.hardwareConcurrency || 4; 
-    statusText.innerText = `Ray Tracing Scene... (${numCores} threads)`;
+    statusText.innerText = `Ray Tracing Scene... (${numCores} threads, ${taskQueue.length} tiles)`;
     let startTime = performance.now();
-    const chunkHeight = Math.ceil(height / numCores);
 
-    for (let i = 0; i < numCores; i++) {
-        const worker = new Worker(workerUrl);
-        workers.push(worker);
-        const startY = i * chunkHeight;
-        const endY = Math.min(startY + chunkHeight, height);
-        if (startY >= height) break;
-
-        activeWorkers++;
-        worker.onmessage = (e) => {
-            const { startY: retStartY, endY: retEndY, buffer } = e.data;
-            const imageData = new ImageData(new Uint8ClampedArray(buffer), width, retEndY - retStartY);
-            ctx.putImageData(imageData, 0, height - retEndY);
-            
+    function assignNextTask(worker) {
+        if (taskQueue.length > 0) {
+            const task = taskQueue.shift();
+            worker.postMessage({
+                ...task, imageWidth: width, imageHeight: height, samples, maxDepth, camParams, lightConfig, matConfig
+            });
+        } else {
+            worker.terminate();
             activeWorkers--;
             if (activeWorkers === 0) {
                 statusText.innerText = `Finished in ${((performance.now() - startTime) / 1000).toFixed(2)}s`;
             }
+        }
+    }
+
+    for (let i = 0; i < numCores; i++) {
+        if (taskQueue.length === 0) break;
+        
+        const worker = new Worker(workerUrl);
+        workers.push(worker);
+        activeWorkers++;
+
+        worker.onmessage = (e) => {
+            const { startX, startY, tileWidth, tileHeight, buffer } = e.data;
+            const imageData = new ImageData(new Uint8ClampedArray(buffer), tileWidth, tileHeight);
+            
+            // Map the mathematical bottom-up Y coordinate to the HTML Canvas top-down Y coordinate
+            const canvasY = height - startY - tileHeight;
+            ctx.putImageData(imageData, startX, canvasY);
+            
+            assignNextTask(worker);
         };
 
-        worker.postMessage({ startY, endY, width, height, samples, maxDepth, camParams, lightConfig, matConfig });
+        assignNextTask(worker);
     }
 }
 
 // Bind Events dynamically
 Object.keys(elements).forEach(key => {
     elements[key].addEventListener('change', (e) => {
-        // Update text labels automatically if they exist
         const valSpan = document.getElementById(key + 'Val');
         if(valSpan) {
-            // keep decimals for floats, ints for ints
             valSpan.innerText = e.target.step && e.target.step.includes('.') 
                 ? parseFloat(e.target.value).toFixed(2) 
                 : e.target.value;
