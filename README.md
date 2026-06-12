@@ -13,6 +13,12 @@ By porting the core C++ math into JavaScript and leveraging Web Workers for para
 
 - Accessibility: They remove the barrier to entry. Instead of needing to install CMake, a C++ compiler, and an IDE to see the book's final results, anyone with a standard web browser can experiment with the physics of light directly on the page.
 
+## Features
+
+- Interactive ray tracing parameters.
+- Employed Bucket Rendering to speed up rendering time.
+- Replacing White-Noise-based RNG with Quasi-Monte Carlo (Blue Noise) sampling.
+
 ## Screenshots
 
 Performance tested on pure M4 Pro CPU
