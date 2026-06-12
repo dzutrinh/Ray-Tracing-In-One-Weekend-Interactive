@@ -25,12 +25,12 @@
         <div class="control-panel">
             <div class="panel-title">Renderer Limits</div>
             <div class="control-group">
-                <label>Enable Two-pass simple denoiser:</label>
+                <label>Enable Two-phase simple denoiser:</label>
                 <input type="checkbox" id="denoiseToggle">
             </div>
             <div class="control-group">
                 <label>Samples/Pixel:</label>
-                <div><span id="samplesVal">50</span> <input type="range" id="samplesSlider" min="10" max="1000" step="10" value="50"></div>
+                <div><span id="samplesVal">20</span> <input type="range" id="samplesSlider" min="5" max="200" step="5" value="20"></div>
             </div>
             <div class="control-group">
                 <label>Max Bounces:</label>
@@ -82,6 +82,46 @@ const workerScript = `
     class Ray {
         constructor(origin, direction, time = 0.0) { this.origin = origin; this.direction = direction; this.time = time; }
         at(t) { return this.origin.add(this.direction.mul(t)); }
+    }
+
+
+    // --- PRE-COMPUTED LUT OPTIMIZATION ---
+    function computeHaltonLUT(base, size) {
+        let lut = new Float32Array(size);
+        for (let k = 0; k < size; k++) {
+            let result = 0;
+            let f = 1.0 / base;
+            let i = k + 1;
+            while (i > 0) {
+                result = result + f * (i % base);
+                i = Math.floor(i / base);
+                f = f / base;
+            }
+            lut[k] = result;
+        }
+        return lut;
+    }
+
+    // We pre-compute 1024 values per dimension just once when the worker spawns!
+    const LUT_SIZE = 1024;
+    const halton2 = computeHaltonLUT(2, LUT_SIZE);
+    const halton3 = computeHaltonLUT(3, LUT_SIZE);
+    const halton5 = computeHaltonLUT(5, LUT_SIZE);
+
+    // --- QUASI-MONTE CARLO (HALTON SEQUENCE) --- 
+    // NOTE: The halton() function is no longer used in the main rendering loop, 
+    // but is kept here for reference and educational purposes. The actual sampling 
+    // now uses the pre-computed LUTs for performance reasons. ---
+    function halton(index, base) {
+        let result = 0;
+        let f = 1.0 / base;
+        let i = index;
+        while (i > 0) {
+            result = result + f * (i % base);
+            i = Math.floor(i / base);
+            f = f / base;
+        }
+        return result;
     }
 
     // --- TEXTURES ---
@@ -172,7 +212,6 @@ const workerScript = `
         }
     }
 
-    // NEW: Motion Blur Sphere
     class MovingSphere {
         constructor(center0, center1, time0, time1, radius, material) {
             this.center0 = center0; this.center1 = center1;
@@ -255,7 +294,6 @@ const workerScript = `
         }
     }
 
-    // --- TRANSFORMS & LISTS ---
     class Translate {
         constructor(obj, offset) { this.obj = obj; this.offset = offset; }
         hit(ray, t_min, t_max) {
@@ -267,7 +305,6 @@ const workerScript = `
         }
     }
 
-    // NEW: Proper Matrix Rotation
     class RotateY {
         constructor(obj, angle) {
             this.obj = obj;
@@ -319,7 +356,6 @@ const workerScript = `
         }
     }
 
-    // NEW: Lightweight AABB pseudo-BVH node to dramatically speed up JS rendering
     class BoundingNode {
         constructor(hittable, min, max) {
             this.hittable = hittable;
@@ -344,7 +380,6 @@ const workerScript = `
         }
     }
 
-    // NEW: True Box Construction
     function box(a, b, mat) {
         let sides = new HittableList();
         let min = new Vec3(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.min(a.z, b.z));
@@ -353,12 +388,12 @@ const workerScript = `
         let dy = new Vec3(0, max.y - min.y, 0);
         let dz = new Vec3(0, 0, max.z - min.z);
 
-        sides.add(new Quad(new Vec3(min.x, min.y, max.z), dx, dy, mat)); // front
-        sides.add(new Quad(new Vec3(max.x, min.y, max.z), dz.mul(-1), dy, mat)); // right
-        sides.add(new Quad(new Vec3(max.x, min.y, min.z), dx.mul(-1), dy, mat)); // back
-        sides.add(new Quad(new Vec3(min.x, min.y, min.z), dz, dy, mat)); // left
-        sides.add(new Quad(new Vec3(min.x, max.y, max.z), dx, dz.mul(-1), mat)); // top
-        sides.add(new Quad(new Vec3(min.x, min.y, min.z), dx, dz, mat)); // bottom
+        sides.add(new Quad(new Vec3(min.x, min.y, max.z), dx, dy, mat)); 
+        sides.add(new Quad(new Vec3(max.x, min.y, max.z), dz.mul(-1), dy, mat)); 
+        sides.add(new Quad(new Vec3(max.x, min.y, min.z), dx.mul(-1), dy, mat)); 
+        sides.add(new Quad(new Vec3(min.x, min.y, min.z), dz, dy, mat)); 
+        sides.add(new Quad(new Vec3(min.x, max.y, max.z), dx, dz.mul(-1), mat)); 
+        sides.add(new Quad(new Vec3(min.x, min.y, min.z), dx, dz, mat)); 
         return sides;
     }
 
@@ -380,14 +415,13 @@ const workerScript = `
     function buildScene(cfg) {
         let world = new HittableList();
         
-        // --- DETERMINISTIC SEED ---
         let seed = 9876543;
         function seededRandom(min=0, max=1) {
             seed = (seed * 9301 + 49297) % 233280;
             return min + (seed / 233280) * (max - min);
         }
 
-        // 1. GROUND BOXES (Full 20x20 Grid)
+        // 1. GROUND BOXES 
         let boxes1 = new HittableList();
         let groundMat = new Lambertian(new SolidColor(new Vec3(0.48, 0.83, 0.53)));
         let boxes_per_side = 20; 
@@ -401,14 +435,13 @@ const workerScript = `
                 boxes1.add(box(new Vec3(x0,y0,z0), new Vec3(x1,y1,z1), groundMat));
             }
         }
-        // Wrap 2400 quads in a lightweight bounding box so it runs fast in JS
         world.add(new BoundingNode(boxes1, new Vec3(-1000, 0, -1000), new Vec3(1000, 102, 1000)));
 
         // 2. LIGHT Panel
         let light = new DiffuseLight(new Vec3(7, 7, 7));
         world.add(new Quad(new Vec3(123,554,147), new Vec3(300,0,0), new Vec3(0,0,265), light));
 
-        // 3. Central Spheres (With Proper Motion Blur!)
+        // 3. Central Spheres
         let center1 = new Vec3(400, 400, 200);
         let center2 = center1.add(new Vec3(30, 0, 0));
         world.add(new MovingSphere(center1, center2, 0, 1, 50, new Lambertian(new SolidColor(new Vec3(0.7, 0.3, 0.1))))); 
@@ -432,7 +465,7 @@ const workerScript = `
         let earthMat = new Lambertian(new SolidColor(new Vec3(0.2, 0.3, 0.6))); 
         world.add(new Sphere(new Vec3(400, 200, 400), 100, earthMat)); 
 
-        // 7. Translated & Rotated Block Cluster (Full 1000 spheres)
+        // 7. Translated & Rotated Block Cluster 
         let boxes2 = new HittableList();
         let white = new Lambertian(new SolidColor(new Vec3(0.73, 0.73, 0.73)));
         for(let j=0; j<1000; j++) {
@@ -442,7 +475,6 @@ const workerScript = `
             boxes2.add(new Sphere(new Vec3(rx, ry, rz), 10, white));
         }
         
-        // Wrap 1000 spheres in a bounding box, then rotate and translate them
         let clusterNode = new BoundingNode(boxes2, new Vec3(0,0,0), new Vec3(175,175,175));
         world.add(new Translate(new RotateY(clusterNode, 15), new Vec3(-100, 270, 395)));
 
@@ -477,14 +509,28 @@ const workerScript = `
         let ptr = 0;
         for (let j = endY - 1; j >= startY; --j) {
             for (let i = startX; i < endX; ++i) {
+                // CRANLEY-PATTERSON ROTATION 
+                let pixel_hash = (i * 73856093) ^ (j * 19349663);
+                let rand_offset_x = (pixel_hash & 0xFFFF) / 65535.0;
+                let rand_offset_y = ((pixel_hash >> 16) & 0xFFFF) / 65535.0;
+                // Add a hash dimension for time offsets as well!
+                let rand_offset_t = ((pixel_hash * 39916801) & 0xFFFF) / 65535.0; 
+
                 let pixel_color = new Vec3(0, 0, 0);
+                
                 for (let s = 0; s < cfg.samples; ++s) {
-                    let s_u = (i + Math.random()) / (imageWidth - 1);
-                    let s_v = (j + Math.random()) / (imageHeight - 1);
+                    // FAST PRE-COMPUTED LUT LOOKUP
+                    let s_idx = s % LUT_SIZE;
+                    let u_offset = (halton2[s_idx] + rand_offset_x) % 1.0;
+                    let v_offset = (halton3[s_idx] + rand_offset_y) % 1.0;
+                    let t_offset = (halton5[s_idx] + rand_offset_t) % 1.0;
+                    
+                    let s_u = (i + u_offset) / (imageWidth - 1);
+                    let s_v = (j + v_offset) / (imageHeight - 1);
                     let dir = lower_left_corner.add(horizontal.mul(s_u)).add(vertical.mul(s_v)).sub(origin);
                     
-                    // Assign random ray time for Motion Blur!
-                    let r = new Ray(origin, dir, Math.random());
+                    // Assign Halton time for smooth Motion Blur
+                    let r = new Ray(origin, dir, t_offset);
                     pixel_color = pixel_color.add(rayColor(r, world, cfg.depth));
                 }
                 
@@ -640,7 +686,6 @@ function startRender() {
         }
     }
     
-    // Sort from center outward so the coolest stuff renders first!
     taskQueue.sort((a, b) => {
         let distA = Math.pow(a.startX - width/2, 2) + Math.pow(a.startY - height/2, 2);
         let distB = Math.pow(b.startX - width/2, 2) + Math.pow(b.startY - height/2, 2);

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Ray Tracing: The Rest of Your Life (Advanced Denoiser)</title>
+    <title>Ray Tracing: The Rest of Your Life</title>
     <style>
         body { background-color: #1a1a1a; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin-top: 1rem; }
         canvas { background-color: black; box-shadow: 0 4px 15px rgba(0,0,0,0.8); border-radius: 4px; margin-bottom: 1rem; }
@@ -25,12 +25,12 @@
         <div class="control-panel">
             <div class="panel-title">Render Engine</div>
             <div class="control-group">
-                <label>Enable Two-pass simple Denoiser:</label>
+                <label>Enable Two-pass simple denoiser:</label>
                 <input type="checkbox" id="denoiseToggle">
             </div>
             <div class="control-group">
                 <label>Samples/Pixel:</label>
-                <div><span id="samplesVal">50</span> <input type="range" id="samplesSlider" min="1" max="1024" step="1" value="50"></div>
+                <div><span id="samplesVal">50</span> <input type="range" id="samplesSlider" min="1" max="1000" step="1" value="50"></div>
             </div>
             <div class="control-group">
                 <label>Max Bounce Depth:</label>
@@ -39,10 +39,6 @@
             <div class="control-group">
                 <label>Light Intensity:</label>
                 <div><span id="intensityVal">15</span> <input type="range" id="intensitySlider" min="1" max="50" value="15"></div>
-            </div>
-            <div class="control-group">
-                <label>Light Color:</label>
-                <input type="color" id="lightColorPicker" value="#ffffff">
             </div>
         </div>
 
@@ -75,10 +71,7 @@ const workerScript = `
         static cross(u, v) { return new Vec3(u.y*v.z - u.z*v.y, u.z*v.x - u.x*v.z, u.x*v.y - u.y*v.x); }
         static random(min=0, max=1) { return new Vec3(min + Math.random()*(max-min), min + Math.random()*(max-min), min + Math.random()*(max-min)); }
         static randomInUnitSphere() {
-            while (true) {
-                let p = Vec3.random(-1, 1);
-                if (p.lengthSq() < 1) return p;
-            }
+            while (true) { let p = Vec3.random(-1, 1); if (p.lengthSq() < 1) return p; }
         }
         static randomUnitVector() { return Vec3.randomInUnitSphere().normalize(); }
         static reflect(v, n) { return v.sub(n.mul(2 * Vec3.dot(v, n))); }
@@ -93,6 +86,44 @@ const workerScript = `
     class Ray {
         constructor(origin, direction) { this.origin = origin; this.direction = direction; }
         at(t) { return this.origin.add(this.direction.mul(t)); }
+    }
+
+    // --- PRE-COMPUTED LUT OPTIMIZATION ---
+    function computeHaltonLUT(base, size) {
+        let lut = new Float32Array(size);
+        for (let k = 0; k < size; k++) {
+            let result = 0;
+            let f = 1.0 / base;
+            let i = k + 1;
+            while (i > 0) {
+                result = result + f * (i % base);
+                i = Math.floor(i / base);
+                f = f / base;
+            }
+            lut[k] = result;
+        }
+        return lut;
+    }
+
+    // Pre-compute 1024 values per dimension when the worker starts
+    const LUT_SIZE = 1024;
+    const halton2 = computeHaltonLUT(2, LUT_SIZE); // Pixel X anti-aliasing
+    const halton3 = computeHaltonLUT(3, LUT_SIZE); // Pixel Y anti-aliasing
+
+    // --- QUASI-MONTE CARLO (HALTON SEQUENCE) ---
+    // Instead of computing the Halton value from scratch for each sample, 
+    // we use a pre-computed LUT and apply a Cranley-Patterson rotation to 
+    // ensure good distribution without visible patterns.
+    function halton(index, base) {
+        let result = 0;
+        let f = 1.0 / base;
+        let i = index;
+        while (i > 0) {
+            result = result + f * (i % base);
+            i = Math.floor(i / base);
+            f = f / base;
+        }
+        return result;
     }
 
     class Material {
@@ -137,8 +168,7 @@ const workerScript = `
             return { ray: new Ray(rec.p, direction), attenuation: new Vec3(1.0, 1.0, 1.0) };
         }
         reflectance(cosine, ref_idx) {
-            let r0 = (1 - ref_idx) / (1 + ref_idx);
-            r0 = r0 * r0;
+            let r0 = (1 - ref_idx) / (1 + ref_idx); r0 = r0 * r0;
             return r0 + (1 - r0) * Math.pow((1 - cosine), 5);
         }
     }
@@ -160,20 +190,15 @@ const workerScript = `
         hit(ray, t_min, t_max) {
             let denom = Vec3.dot(this.normal, ray.direction);
             if (Math.abs(denom) < 1e-8) return null;
-            
             let t = (this.D - Vec3.dot(this.normal, ray.origin)) / denom;
             if (t < t_min || t > t_max) return null;
-            
             let intersection = ray.at(t);
             let planar_hitpt_vector = intersection.sub(this.Q);
             let alpha = Vec3.dot(this.w, Vec3.cross(planar_hitpt_vector, this.v));
             let beta = Vec3.dot(this.w, Vec3.cross(this.u, planar_hitpt_vector));
-            
             if (alpha < 0 || alpha > 1 || beta < 0 || beta > 1) return null;
-            
             let front_face = Vec3.dot(ray.direction, this.normal) < 0;
             let normal = front_face ? this.normal : this.normal.mul(-1);
-            
             return { t: t, p: intersection, normal: normal, front_face: front_face, material: this.material };
         }
     }
@@ -186,16 +211,13 @@ const workerScript = `
             let half_b = Vec3.dot(oc, ray.direction);
             let c = oc.lengthSq() - this.radius * this.radius;
             let discriminant = half_b * half_b - a * c;
-            
             if (discriminant < 0) return null;
             let sqrtd = Math.sqrt(discriminant);
             let root = (-half_b - sqrtd) / a;
-            
             if (root <= t_min || t_max <= root) {
                 root = (-half_b + sqrtd) / a;
                 if (root <= t_min || t_max <= root) return null;
             }
-            
             let p = ray.at(root);
             let outward_normal = p.sub(this.center).div(this.radius);
             let front_face = Vec3.dot(ray.direction, outward_normal) < 0;
@@ -221,7 +243,7 @@ const workerScript = `
     function rayColor(ray, world, depth) {
         if (depth <= 0) return new Vec3(0, 0, 0);
         let rec = world.hit(ray, 0.001, Infinity);
-        if (!rec) return new Vec3(0, 0, 0); // Void background
+        if (!rec) return new Vec3(0, 0, 0); 
         
         let emitted = rec.material.emitted();
         let scatterResult = rec.material.scatter(ray, rec);
@@ -288,10 +310,23 @@ const workerScript = `
         let ptr = 0;
         for (let j = endY - 1; j >= startY; --j) {
             for (let i = startX; i < endX; ++i) {
+                
+                // CRANLEY-PATTERSON ROTATION: Give each pixel a unique sub-seed so the Halton 
+                // pattern doesn't create visible structural lines across the screen.
+                let pixel_hash = (i * 73856093) ^ (j * 19349663);
+                let rand_offset_x = (pixel_hash & 0xFFFF) / 65535.0;
+                let rand_offset_y = ((pixel_hash >> 16) & 0xFFFF) / 65535.0;
+
                 let pixel_color = new Vec3(0, 0, 0);
+                
                 for (let s = 0; s < samples; ++s) {
-                    let s_u = (i + Math.random()) / (imageWidth - 1);
-                    let s_v = (j + Math.random()) / (imageHeight - 1);
+                    // FAST PRE-COMPUTED LUT LOOKUP
+                    let s_idx = s % LUT_SIZE;
+                    let u_offset = (halton2[s_idx] + rand_offset_x) % 1.0;
+                    let v_offset = (halton3[s_idx] + rand_offset_y) % 1.0;
+                    
+                    let s_u = (i + u_offset) / (imageWidth - 1);
+                    let s_v = (j + v_offset) / (imageHeight - 1);
                     
                     let dir = lower_left_corner.add(horizontal.mul(s_u)).add(vertical.mul(s_v)).sub(origin);
                     let r = new Ray(origin, dir);
@@ -319,11 +354,11 @@ const statusText = document.getElementById('status');
 const blob = new Blob([workerScript], { type: 'application/javascript' });
 const workerUrl = URL.createObjectURL(blob);
 
+// DOM Elements
 const elements = {
     samples: document.getElementById('samplesSlider'),
     depth: document.getElementById('depthSlider'),
     intensity: document.getElementById('intensitySlider'),
-    color: document.getElementById('lightColorPicker'),
     roughness: document.getElementById('roughnessSlider'),
     ior: document.getElementById('iorSlider'),
     denoise: document.getElementById('denoiseToggle')
@@ -332,18 +367,8 @@ const elements = {
 let workers = [];
 let activeWorkers = 0;
 let taskQueue = [];
-let rawImageData = null; 
+let rawImageData = null;
 
-function hexToRgb(hex) {
-    let result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-    return result ? {
-        r: parseInt(result[1], 16) / 255,
-        g: parseInt(result[2], 16) / 255,
-        b: parseInt(result[3], 16) / 255
-    } : { r: 1, g: 1, b: 1 };
-}
-
-// TWO-PASS ADVANCED DENOISER
 function applyDenoiser() {
     if (!rawImageData) return;
     statusText.innerText = "Applying Advanced 2-Pass Denoiser...";
@@ -354,37 +379,27 @@ function applyDenoiser() {
         const data = rawImageData.data;
         const size = width * height * 4;
 
-        // PASS 1: FIREFLY REJECTION (Neighborhood Clamping)
-        // Detects extreme black/white outliers and clamps them to the local neighbor max/min.
+        // PASS 1: FIREFLY REJECTION
         const clampedData = new Uint8ClampedArray(size);
         for (let y = 0; y < height; y++) {
             for (let x = 0; x < width; x++) {
                 const idx = (y * width + x) * 4;
-
-                // Skip immediate edges for simplicity
                 if (x === 0 || x === width - 1 || y === 0 || y === height - 1) {
                     clampedData[idx] = data[idx]; clampedData[idx+1] = data[idx+1];
-                    clampedData[idx+2] = data[idx+2]; clampedData[idx+3] = 255;
-                    continue;
+                    clampedData[idx+2] = data[idx+2]; clampedData[idx+3] = 255; continue;
                 }
-
                 let minR = 255, minG = 255, minB = 255;
                 let maxR = 0, maxG = 0, maxB = 0;
-
-                // Check the 8 surrounding neighbors
                 for (let dy = -1; dy <= 1; dy++) {
                     for (let dx = -1; dx <= 1; dx++) {
                         if (dx === 0 && dy === 0) continue;
                         const nIdx = ((y + dy) * width + (x + dx)) * 4;
                         const r = data[nIdx], g = data[nIdx+1], b = data[nIdx+2];
-
                         if (r < minR) minR = r; if (r > maxR) maxR = r;
                         if (g < minG) minG = g; if (g > maxG) maxG = g;
                         if (b < minB) minB = b; if (b > maxB) maxB = b;
                     }
                 }
-
-                // Clamp the center pixel to prevent extreme fireflies/dead pixels
                 clampedData[idx]   = Math.max(minR, Math.min(maxR, data[idx]));
                 clampedData[idx+1] = Math.max(minG, Math.min(maxG, data[idx+1]));
                 clampedData[idx+2] = Math.max(minB, Math.min(maxB, data[idx+2]));
@@ -392,11 +407,11 @@ function applyDenoiser() {
             }
         }
 
-        // PASS 2: BILATERAL FILTER (Edge-Preserving Blur)
+        // PASS 2: BILATERAL FILTER
         const output = new Uint8ClampedArray(size);
-        const radius = 2; // 5x5 window
+        const radius = 2; 
         const sigmaSpatial = 2.0;
-        const sigmaColor = 0.25 * 255; // Color tolerance
+        const sigmaColor = 0.25 * 255; 
 
         const spatialWeights = [];
         for (let dy = -radius; dy <= radius; dy++) {
@@ -408,26 +423,18 @@ function applyDenoiser() {
         for (let y = 0; y < height; y++) {
             for (let x = 0; x < width; x++) {
                 const idx = (y * width + x) * 4;
-                const r = clampedData[idx];
-                const g = clampedData[idx+1];
-                const b = clampedData[idx+2];
-
-                let rSum = 0, gSum = 0, bSum = 0, wSum = 0;
-                let wIdx = 0;
+                const r = clampedData[idx]; const g = clampedData[idx+1]; const b = clampedData[idx+2];
+                let rSum = 0, gSum = 0, bSum = 0, wSum = 0; let wIdx = 0;
 
                 for (let dy = -radius; dy <= radius; dy++) {
                     const ny = y + dy;
                     if (ny < 0 || ny >= height) { wIdx += (radius*2+1); continue; }
-
                     const rowOffset = ny * width;
                     for (let dx = -radius; dx <= radius; dx++) {
                         const nx = x + dx;
                         if (nx < 0 || nx >= width) { wIdx++; continue; }
-
                         const nIdx = (rowOffset + nx) * 4;
-                        const nr = clampedData[nIdx];
-                        const ng = clampedData[nIdx+1];
-                        const nb = clampedData[nIdx+2];
+                        const nr = clampedData[nIdx]; const ng = clampedData[nIdx+1]; const nb = clampedData[nIdx+2];
 
                         const distColorSq = (r-nr)*(r-nr) + (g-ng)*(g-ng) + (b-nb)*(b-nb);
                         const colorWeight = Math.exp(-distColorSq / (2 * sigmaColor * sigmaColor));
@@ -437,11 +444,8 @@ function applyDenoiser() {
                         wSum += weight;
                     }
                 }
-
-                output[idx] = rSum / wSum;
-                output[idx+1] = gSum / wSum;
-                output[idx+2] = bSum / wSum;
-                output[idx+3] = 255;
+                output[idx] = rSum / wSum; output[idx+1] = gSum / wSum;
+                output[idx+2] = bSum / wSum; output[idx+3] = 255;
             }
         }
 
@@ -469,10 +473,9 @@ function startRender() {
         defocus_angle: 0.0
     };
     
-    const rgb = hexToRgb(elements.color.value);
     const lightConfig = {
         intensity: parseFloat(elements.intensity.value),
-        r: rgb.r, g: rgb.g, b: rgb.b
+        r: 1, g: 1, b: 1
     };
 
     const matConfig = {
@@ -500,7 +503,7 @@ function startRender() {
     taskQueue.reverse();
 
     const numCores = navigator.hardwareConcurrency || 4; 
-    statusText.innerText = `Ray Tracing Scene... (${numCores} threads, ${taskQueue.length} tiles)`;
+    statusText.innerText = `Ray Tracing Scene... (${numCores} threads)`;
     let startTime = performance.now();
 
     function assignNextTask(worker) {
@@ -513,14 +516,9 @@ function startRender() {
             worker.terminate();
             activeWorkers--;
             if (activeWorkers === 0) {
-                // RENDER COMPLETE! Cache the raw noisy data.
                 rawImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                
-                if (elements.denoise.checked) {
-                    applyDenoiser();
-                } else {
-                    statusText.innerText = `Render Finished in ${((performance.now() - startTime) / 1000).toFixed(2)}s`;
-                }
+                if (elements.denoise.checked) applyDenoiser();
+                else statusText.innerText = `Render Finished in ${((performance.now() - startTime) / 1000).toFixed(2)}s`;
             }
         }
     }
@@ -535,10 +533,8 @@ function startRender() {
         worker.onmessage = (e) => {
             const { startX, startY, tileWidth, tileHeight, buffer } = e.data;
             const imageData = new ImageData(new Uint8ClampedArray(buffer), tileWidth, tileHeight);
-            
             const canvasY = height - startY - tileHeight;
             ctx.putImageData(imageData, startX, canvasY);
-            
             assignNextTask(worker);
         };
 
@@ -550,10 +546,8 @@ Object.keys(elements).forEach(key => {
     if (key === 'denoise') {
         elements[key].addEventListener('change', (e) => {
             if (activeWorkers > 0) return; 
-            
-            if (e.target.checked) {
-                applyDenoiser();
-            } else if (rawImageData) {
+            if (e.target.checked) applyDenoiser();
+            else if (rawImageData) {
                 ctx.putImageData(rawImageData, 0, 0);
                 statusText.innerText = "Denoiser Disabled (Showing Raw Output)";
             }
